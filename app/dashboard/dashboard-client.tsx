@@ -57,13 +57,16 @@ const statusLabels: Record<JobStatus, string> = {
 };
 
 const sourceLabels: Record<JobSource, string> = {
+  facebook: "Facebook",
+  google: "Google",
+  instagram: "Instagram",
   manual: "Manual",
-  website_form: "Website form",
+  other: "Other",
   phone: "Phone",
   referral: "Referral",
-  google: "Google",
-  facebook: "Facebook",
-  other: "Other",
+  repeat_customer: "Repeat customer",
+  walk_in: "Walk-in",
+  website_form: "Website form",
 };
 
 const intakeFieldTypeLabels: Record<IntakeFieldType, string> = {
@@ -78,6 +81,7 @@ const intakeFieldTypeLabels: Record<IntakeFieldType, string> = {
 const statusOrder: JobStatus[] = ["lead", "contacted", "quoted", "scheduled", "in_progress", "completed", "lost"];
 const statusChangeOrder: JobStatus[] = ["lead", "contacted", "quoted", "scheduled", "in_progress", "completed"];
 const pipelineStatuses: JobStatus[] = ["lead", "contacted", "quoted", "scheduled", "in_progress", "completed", "lost"];
+const sourceOrder: JobSource[] = ["website_form", "google", "facebook", "instagram", "referral", "repeat_customer", "phone", "walk_in", "manual", "other"];
 const navItems: View[] = ["Overview", "Pipeline", "Jobs", "Customers", "Calendar", "Analytics", "Settings"];
 const operationalStatuses: JobStatus[] = ["scheduled", "in_progress"];
 
@@ -474,7 +478,7 @@ export function DashboardClient({
     .reduce((sum, job) => sum + job.price_cents, 0);
   const completedRevenue = jobs
     .filter((job) => job.status === "completed")
-    .reduce((sum, job) => sum + job.price_cents, 0);
+    .reduce((sum, job) => sum + job.revenue_cents, 0);
   const averageJobValue = jobs.length
     ? Math.round(jobs.reduce((sum, job) => sum + job.price_cents, 0) / jobs.length)
     : 0;
@@ -1398,6 +1402,7 @@ function AnalyticsView({
   totalPipeline: number;
 }) {
   const maxCount = Math.max(...Object.values(counts), 1);
+  const sourceRows = buildSourcePerformance(jobs);
 
   return (
     <>
@@ -1429,8 +1434,67 @@ function AnalyticsView({
             : "Analytics will become useful after you add your first few jobs."}
         </div>
       </section>
+      <section className="data-panel full-width analytics-panel">
+        <div className="panel-heading compact">
+          <h2>Source performance</h2>
+          <p className="muted">Lead sources, follow-through, and booked revenue from real job data.</p>
+        </div>
+        {sourceRows.length ? (
+          <div className="jobs-table-wrap">
+            <table className="jobs-table source-performance-table">
+              <thead>
+                <tr>
+                  <th>Source</th>
+                  <th>Leads</th>
+                  <th>Contacted</th>
+                  <th>Won / Completed</th>
+                  <th>Revenue</th>
+                  <th>Conversion</th>
+                </tr>
+              </thead>
+              <tbody>
+                {sourceRows.map((row) => (
+                  <tr key={row.source}>
+                    <td className="identity-cell">
+                      <strong>{sourceLabels[row.source]}</strong>
+                    </td>
+                    <td>{row.leads}</td>
+                    <td>{row.contacted}</td>
+                    <td>{row.won}</td>
+                    <td className="numeric-cell">{money(row.revenue)}</td>
+                    <td>{row.conversionRate}%</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <EmptyState description="Create jobs with lead sources to compare which channels turn into revenue." title="No source data yet" />
+        )}
+      </section>
     </>
   );
+}
+
+function buildSourcePerformance(jobs: Job[]) {
+  return sourceOrder
+    .map((source) => {
+      const sourceJobs = jobs.filter((job) => job.source === source);
+      const leads = sourceJobs.length;
+      const contacted = sourceJobs.filter((job) => job.first_contact_at || job.status !== "lead").length;
+      const wonJobs = sourceJobs.filter((job) => job.status !== "lost" && (job.won_at || job.completed_at || job.status === "completed"));
+      const revenue = wonJobs.reduce((sum, job) => sum + job.revenue_cents, 0);
+
+      return {
+        contacted,
+        conversionRate: leads ? Math.round((wonJobs.length / leads) * 100) : 0,
+        leads,
+        revenue,
+        source,
+        won: wonJobs.length,
+      };
+    })
+    .filter((row) => row.leads > 0);
 }
 
 function SettingsView({ business, intakeFields }: { business: Business; intakeFields: IntakeField[] }) {
@@ -1818,6 +1882,16 @@ export function JobFields({
           <label htmlFor="price">Job value</label>
           <input id="price" name="price" inputMode="decimal" defaultValue={job ? inputMoney(job.price_cents) : ""} placeholder="3200" />
         </div>
+      </div>
+      <div className="field">
+        <label htmlFor="source">Lead source</label>
+        <select id="source" name="source" defaultValue={job?.source ?? "manual"}>
+          {sourceOrder.map((value) => (
+            <option key={value} value={value}>
+              {sourceLabels[value]}
+            </option>
+          ))}
+        </select>
       </div>
       <div className="split-fields">
         <div className="field">

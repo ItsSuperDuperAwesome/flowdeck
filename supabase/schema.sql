@@ -69,9 +69,12 @@ create table if not exists public.jobs (
   notes text,
   first_contact_at timestamptz,
   quote_sent_at timestamptz,
+  won_at timestamptz,
   next_follow_up_at timestamptz,
   lost_at timestamptz,
+  completed_at timestamptz,
   lost_reason text,
+  revenue_cents bigint not null default 0 check (revenue_cents >= 0),
   intake_upload_token text,
   intake_data jsonb not null default '{}'::jsonb,
   created_at timestamptz not null default now(),
@@ -160,9 +163,12 @@ alter table public.jobs add column if not exists square_feet integer check (squa
 alter table public.jobs add column if not exists budget_range text;
 alter table public.jobs add column if not exists first_contact_at timestamptz;
 alter table public.jobs add column if not exists quote_sent_at timestamptz;
+alter table public.jobs add column if not exists won_at timestamptz;
 alter table public.jobs add column if not exists next_follow_up_at timestamptz;
 alter table public.jobs add column if not exists lost_at timestamptz;
+alter table public.jobs add column if not exists completed_at timestamptz;
 alter table public.jobs add column if not exists lost_reason text;
+alter table public.jobs add column if not exists revenue_cents bigint not null default 0;
 alter table public.jobs add column if not exists intake_dedupe_key text;
 alter table public.jobs add column if not exists intake_upload_token text;
 alter table public.jobs add column if not exists intake_data jsonb not null default '{}'::jsonb;
@@ -208,7 +214,11 @@ alter table public.intake_fields add column if not exists updated_at timestamptz
 
 alter table public.jobs drop constraint if exists jobs_source_check;
 alter table public.jobs add constraint jobs_source_check
-check (source in ('manual', 'website_form', 'phone', 'referral', 'google', 'facebook', 'other'));
+check (source in ('manual', 'website_form', 'google', 'facebook', 'instagram', 'referral', 'repeat_customer', 'phone', 'walk_in', 'other'));
+
+alter table public.jobs drop constraint if exists jobs_revenue_cents_check;
+alter table public.jobs add constraint jobs_revenue_cents_check
+check (revenue_cents >= 0);
 
 alter table public.jobs drop constraint if exists jobs_lost_reason_check;
 alter table public.jobs add constraint jobs_lost_reason_check
@@ -298,6 +308,30 @@ set
   internal_notes = coalesce(nullif(internal_notes, ''), nullif(notes, '')),
   updated_at = now();
 
+update public.jobs
+set
+  won_at = coalesce(won_at, quote_sent_at, scheduled_start, updated_at),
+  revenue_cents = greatest(revenue_cents, price_cents::bigint),
+  updated_at = now()
+where status in ('scheduled', 'in_progress')
+  and price_cents > 0;
+
+update public.jobs
+set
+  won_at = coalesce(won_at, quote_sent_at, scheduled_start, updated_at),
+  completed_at = coalesce(completed_at, updated_at),
+  revenue_cents = greatest(revenue_cents, price_cents::bigint),
+  updated_at = now()
+where status = 'completed'
+  and price_cents > 0;
+
+update public.jobs
+set
+  revenue_cents = 0,
+  updated_at = now()
+where status = 'lost'
+  and revenue_cents <> 0;
+
 insert into public.job_activity (business_id, job_id, event_type, message, metadata)
 select
   jobs.business_id,
@@ -321,6 +355,8 @@ create index if not exists jobs_scheduled_date_idx on public.jobs(scheduled_date
 create index if not exists jobs_scheduled_start_idx on public.jobs(scheduled_start);
 create index if not exists jobs_source_idx on public.jobs(source);
 create index if not exists jobs_preferred_date_idx on public.jobs(preferred_date);
+create index if not exists jobs_won_at_idx on public.jobs(won_at);
+create index if not exists jobs_completed_at_idx on public.jobs(completed_at);
 create unique index if not exists jobs_intake_dedupe_key_idx on public.jobs(business_id, intake_dedupe_key) where intake_dedupe_key is not null;
 create index if not exists quotes_business_id_idx on public.quotes(business_id);
 create index if not exists quotes_job_id_created_at_idx on public.quotes(job_id, created_at desc);

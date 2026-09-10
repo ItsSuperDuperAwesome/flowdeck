@@ -35,13 +35,16 @@ const statusLabels: Record<JobStatus, string> = {
 };
 
 const sourceLabels: Record<JobSource, string> = {
+  facebook: "Facebook",
+  google: "Google",
+  instagram: "Instagram",
   manual: "Manual",
-  website_form: "Website form",
+  other: "Other",
   phone: "Phone",
   referral: "Referral",
-  google: "Google",
-  facebook: "Facebook",
-  other: "Other",
+  repeat_customer: "Repeat customer",
+  walk_in: "Walk-in",
+  website_form: "Website form",
 };
 
 const statusOrder: JobStatus[] = ["lead", "contacted", "quoted", "scheduled", "in_progress", "completed", "lost"];
@@ -171,7 +174,7 @@ export default async function JobDetail({
 
   const { data: jobRow, error: jobError } = await supabase
     .from("jobs")
-    .select("id, business_id, customer_id, title, description, status, price_cents, scheduled_start, scheduled_end, job_address, internal_notes, source, project_type, preferred_date, square_feet, budget_range, first_contact_at, quote_sent_at, next_follow_up_at, lost_at, lost_reason, intake_data, created_at, updated_at, customers(id, business_id, name, email, phone, address_line1, address_line2, city, state, postal_code, notes, created_at, updated_at)")
+    .select("id, business_id, customer_id, title, description, status, price_cents, scheduled_start, scheduled_end, job_address, internal_notes, source, project_type, preferred_date, square_feet, budget_range, first_contact_at, quote_sent_at, won_at, next_follow_up_at, lost_at, completed_at, lost_reason, revenue_cents, intake_data, created_at, updated_at, customers(id, business_id, name, email, phone, address_line1, address_line2, city, state, postal_code, notes, created_at, updated_at)")
     .eq("id", id)
     .single();
 
@@ -241,7 +244,10 @@ export default async function JobDetail({
     { label: "First contact", value: optionalDateLabel(job.first_contact_at) },
     { label: "Quote status", value: quote ? quoteStatusLabels[quote.status] : job.quote_sent_at ? "Quote sent" : "No quote yet" },
     { label: "Quote sent", value: optionalDateLabel(quote?.sent_at ?? job.quote_sent_at) },
+    { label: "Won", value: optionalDateLabel(job.won_at) },
     { label: "Next follow-up", value: optionalDateLabel(job.next_follow_up_at) },
+    ...(job.completed_at ? [{ label: "Completed", value: optionalDateLabel(job.completed_at) }] : []),
+    ...(job.revenue_cents > 0 ? [{ label: "Revenue", value: money(job.revenue_cents) }] : []),
     ...(job.status === "lost" ? [{ label: "Lost reason", value: job.lost_reason ? lostReasonLabels[job.lost_reason] ?? job.lost_reason : "Not recorded" }] : []),
   ];
 

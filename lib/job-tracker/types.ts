@@ -1,6 +1,16 @@
 export type JobStatus = "lead" | "contacted" | "quoted" | "scheduled" | "in_progress" | "completed" | "lost";
 
-export type JobSource = "manual" | "website_form" | "phone" | "referral" | "google" | "facebook" | "other";
+export type JobSource =
+  | "manual"
+  | "website_form"
+  | "phone"
+  | "referral"
+  | "google"
+  | "facebook"
+  | "instagram"
+  | "repeat_customer"
+  | "walk_in"
+  | "other";
 
 export type QuoteStatus = "draft" | "sent" | "accepted" | "declined";
 
@@ -51,9 +61,12 @@ export type Job = {
   budget_range: string | null;
   first_contact_at: string | null;
   quote_sent_at: string | null;
+  won_at: string | null;
   next_follow_up_at: string | null;
   lost_at: string | null;
+  completed_at: string | null;
   lost_reason: string | null;
+  revenue_cents: number;
   intake_data: Record<string, IntakeResponse> | null;
   created_at: string;
   updated_at: string;

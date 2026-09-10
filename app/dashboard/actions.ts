@@ -1,6 +1,6 @@
 "use server";
 
-import type { IntakeFieldType, JobFileCategory, JobStatus, QuoteStatus } from "@/lib/job-tracker/types";
+import type { IntakeFieldType, JobFileCategory, JobSource, JobStatus, QuoteStatus } from "@/lib/job-tracker/types";
 import { createClient } from "@/lib/supabase/server";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
@@ -8,6 +8,7 @@ import { redirect } from "next/navigation";
 const validStatuses: JobStatus[] = ["lead", "contacted", "quoted", "scheduled", "in_progress", "completed", "lost"];
 const validQuoteStatuses: QuoteStatus[] = ["draft", "sent", "accepted", "declined"];
 const validIntakeFieldTypes: IntakeFieldType[] = ["short_text", "long_text", "number", "select", "checkbox", "date"];
+const validSources: JobSource[] = ["website_form", "google", "facebook", "instagram", "referral", "repeat_customer", "phone", "walk_in", "manual", "other"];
 const validLostReasons = ["price", "no_response", "competitor", "timing", "canceled_project", "not_qualified", "other"];
 const confirmedStatuses: JobStatus[] = ["scheduled", "in_progress", "completed"];
 const maxPhotoCount = 5;
@@ -154,12 +155,15 @@ function isClosedStatus(status: JobStatus) {
 }
 
 function statusTransitionUpdate(input: {
+  currentCompletedAt?: string | null;
   currentFirstContactAt?: string | null;
   currentQuoteSentAt?: string | null;
+  currentWonAt?: string | null;
   nextStatus: JobStatus;
+  priceCents?: number;
 }) {
   const now = new Date().toISOString();
-  const update: Record<string, string | null> = {
+  const update: Record<string, string | number | null> = {
     status: input.nextStatus,
   };
 
@@ -181,8 +185,21 @@ function statusTransitionUpdate(input: {
     update.next_follow_up_at = null;
   }
 
+  if ((input.nextStatus === "scheduled" || input.nextStatus === "in_progress" || input.nextStatus === "completed") && !input.currentWonAt) {
+    update.won_at = now;
+  }
+
+  if (input.nextStatus === "completed") {
+    if (!input.currentCompletedAt) {
+      update.completed_at = now;
+    }
+
+    update.revenue_cents = Math.max(0, input.priceCents ?? 0);
+  }
+
   if (input.nextStatus === "lost") {
     update.lost_at = now;
+    update.revenue_cents = 0;
   }
 
   if (input.nextStatus !== "lost") {
@@ -191,6 +208,10 @@ function statusTransitionUpdate(input: {
   }
 
   return update;
+}
+
+function revenueForJob(status: JobStatus, priceCents: number, wonAt?: string | null) {
+  return status === "completed" || Boolean(wonAt) ? Math.max(0, priceCents) : 0;
 }
 
 function statusActivityMessage(from: JobStatus, to: JobStatus) {
@@ -339,7 +360,7 @@ async function requireJobForQuote(jobId: string) {
   const { supabase, userId } = await requireUser();
   const { data: job, error } = await supabase
     .from("jobs")
-    .select("id, business_id, status, price_cents, first_contact_at, quote_sent_at")
+    .select("id, business_id, status, price_cents, revenue_cents, first_contact_at, quote_sent_at, won_at, completed_at")
     .eq("id", jobId)
     .single();
 
@@ -365,7 +386,7 @@ async function requireQuoteForJob(quoteId: string, jobId: string) {
 
   const { data: job, error: jobError } = await supabase
     .from("jobs")
-    .select("id, business_id, status, price_cents, first_contact_at, quote_sent_at")
+    .select("id, business_id, status, price_cents, revenue_cents, first_contact_at, quote_sent_at, won_at, completed_at")
     .eq("id", jobId)
     .eq("business_id", quote.business_id)
     .single();
@@ -513,9 +534,14 @@ export async function createJob(formData: FormData) {
   const scheduledStart = scheduleValue(formData.get("scheduledDate"), formData.get("scheduledTime"));
   const submittedEnd = scheduleValue(formData.get("scheduledEndDate"), formData.get("scheduledEndTime"));
   const scheduledEnd = normalizeScheduledEnd(scheduledStart, submittedEnd);
+  const source = (clean(formData.get("source")) || "manual") as JobSource;
 
   if (!businessId || !customerId || !title) {
     redirect(`/dashboard?message=${message("Customer and job title are required.")}`);
+  }
+
+  if (!validSources.includes(source)) {
+    redirect(`/dashboard?message=${message("Choose a supported lead source.")}`);
   }
 
   if (!validStatuses.includes(status)) {
@@ -548,6 +574,15 @@ export async function createJob(formData: FormData) {
     .filter(Boolean)
     .join(", ");
   const address = optional(formData.get("jobAddress")) ?? (customerAddress || null);
+  const priceCents = moneyToCents(formData.get("price"));
+  const transitionUpdate = statusTransitionUpdate({
+    currentCompletedAt: null,
+    currentFirstContactAt: null,
+    currentQuoteSentAt: null,
+    currentWonAt: null,
+    nextStatus: status,
+    priceCents,
+  });
 
   const { data: job, error } = await supabase
     .from("jobs")
@@ -559,13 +594,14 @@ export async function createJob(formData: FormData) {
       internal_notes: optional(formData.get("internalNotes")),
       job_address: address,
       job_title: title,
-      price_cents: moneyToCents(formData.get("price")),
+      price_cents: priceCents,
+      revenue_cents: revenueForJob(status, priceCents, transitionUpdate.won_at as string | null | undefined),
       scheduled_date: scheduledStart ? scheduledStart.slice(0, 10) : null,
       scheduled_end: scheduledEnd,
       scheduled_start: scheduledStart,
-      source: "manual",
-      status,
+      source,
       title,
+      ...transitionUpdate,
     })
     .select("id")
     .single();
@@ -611,6 +647,7 @@ export async function updateJob(formData: FormData) {
   const submittedEnd = scheduleValue(formData.get("scheduledEndDate"), formData.get("scheduledEndTime"));
   const scheduledEnd = normalizeScheduledEnd(scheduledStart, submittedEnd);
   const priceCents = moneyToCents(formData.get("price"));
+  const source = (clean(formData.get("source")) || "manual") as JobSource;
 
   if (!customerId || !title) {
     redirect(`/jobs/${jobId}?message=${message("Customer and job title are required.")}`);
@@ -618,6 +655,10 @@ export async function updateJob(formData: FormData) {
 
   if (!validStatuses.includes(status)) {
     redirect(`/jobs/${jobId}?message=${message("That status is not supported.")}`);
+  }
+
+  if (!validSources.includes(source)) {
+    redirect(`/jobs/${jobId}?message=${message("Choose a supported lead source.")}`);
   }
 
   if (needsConfirmedSchedule(status) && !scheduledStart) {
@@ -631,7 +672,7 @@ export async function updateJob(formData: FormData) {
   const { supabase, userId } = await requireUser();
   const { data: current, error: currentError } = await supabase
     .from("jobs")
-    .select("business_id, customer_id, title, status, price_cents, scheduled_start, first_contact_at, quote_sent_at, lost_reason")
+    .select("business_id, customer_id, title, status, price_cents, revenue_cents, source, scheduled_start, first_contact_at, quote_sent_at, won_at, completed_at, lost_reason")
     .eq("id", jobId)
     .single();
 
@@ -654,9 +695,13 @@ export async function updateJob(formData: FormData) {
     ? statusTransitionUpdate({
         currentFirstContactAt: current.first_contact_at,
         currentQuoteSentAt: current.quote_sent_at,
+        currentWonAt: current.won_at,
+        currentCompletedAt: current.completed_at,
         nextStatus: status,
+        priceCents,
       })
     : {};
+  const revenueCents = transitionUpdate.revenue_cents ?? revenueForJob(status, priceCents, (transitionUpdate.won_at as string | null | undefined) ?? current.won_at);
 
   const { error } = await supabase
     .from("jobs")
@@ -668,9 +713,11 @@ export async function updateJob(formData: FormData) {
       job_address: optional(formData.get("jobAddress")),
       job_title: title,
       price_cents: priceCents,
+      revenue_cents: revenueCents,
       scheduled_date: scheduledStart ? scheduledStart.slice(0, 10) : null,
       scheduled_end: scheduledEnd,
       scheduled_start: scheduledStart,
+      source,
       status,
       title,
       ...transitionUpdate,
@@ -704,6 +751,14 @@ export async function updateJob(formData: FormData) {
       eventType: "value_changed",
       message: `Job value changed from ${formatMoney(current.price_cents)} to ${formatMoney(priceCents)}.`,
       metadata: { from: current.price_cents, to: priceCents },
+    });
+  }
+
+  if (current.source !== source) {
+    activity.push({
+      eventType: "source_changed",
+      message: "Lead source updated.",
+      metadata: { from: current.source, to: source },
     });
   }
 
@@ -748,7 +803,7 @@ export async function updateJobStatus(formData: FormData) {
   const { supabase, userId } = await requireUser();
   const { data: current, error: currentError } = await supabase
     .from("jobs")
-    .select("business_id, status, scheduled_start, first_contact_at, quote_sent_at")
+    .select("business_id, status, price_cents, scheduled_start, first_contact_at, quote_sent_at, won_at, completed_at")
     .eq("id", jobId)
     .single();
 
@@ -765,9 +820,12 @@ export async function updateJobStatus(formData: FormData) {
   }
 
   const update = statusTransitionUpdate({
+    currentCompletedAt: current.completed_at,
     currentFirstContactAt: current.first_contact_at,
     currentQuoteSentAt: current.quote_sent_at,
+    currentWonAt: current.won_at,
     nextStatus: status,
+    priceCents: current.price_cents,
   });
 
   const { error } = await supabase.from("jobs").update(update).eq("id", jobId);
@@ -802,7 +860,7 @@ export async function markJobContacted(formData: FormData) {
   const { supabase, userId } = await requireUser();
   const { data: current, error: currentError } = await supabase
     .from("jobs")
-    .select("business_id, status, first_contact_at, quote_sent_at, scheduled_start")
+    .select("business_id, status, first_contact_at, quote_sent_at, scheduled_start, won_at, completed_at")
     .eq("id", jobId)
     .single();
 
@@ -812,8 +870,10 @@ export async function markJobContacted(formData: FormData) {
 
   const nextStatus = current.status === "lead" ? "contacted" : current.status;
   const update = statusTransitionUpdate({
+    currentCompletedAt: current.completed_at,
     currentFirstContactAt: current.first_contact_at,
     currentQuoteSentAt: current.quote_sent_at,
+    currentWonAt: current.won_at,
     nextStatus,
   });
   const { error } = await supabase
@@ -849,7 +909,7 @@ export async function markJobQuoted(formData: FormData) {
   const { supabase, userId } = await requireUser();
   const { data: current, error: currentError } = await supabase
     .from("jobs")
-    .select("business_id, status, first_contact_at, quote_sent_at, scheduled_start")
+    .select("business_id, status, first_contact_at, quote_sent_at, scheduled_start, won_at, completed_at")
     .eq("id", jobId)
     .single();
 
@@ -862,8 +922,10 @@ export async function markJobQuoted(formData: FormData) {
   }
 
   const update = statusTransitionUpdate({
+    currentCompletedAt: current.completed_at,
     currentFirstContactAt: current.first_contact_at,
     currentQuoteSentAt: current.quote_sent_at,
+    currentWonAt: current.won_at,
     nextStatus: "quoted",
   });
   const { error } = await supabase
@@ -950,7 +1012,7 @@ export async function markJobLost(formData: FormData) {
   const { supabase, userId } = await requireUser();
   const { data: current, error: currentError } = await supabase
     .from("jobs")
-    .select("business_id, status")
+    .select("business_id, status, lost_at")
     .eq("id", jobId)
     .single();
 
@@ -962,8 +1024,9 @@ export async function markJobLost(formData: FormData) {
   const { error } = await supabase
     .from("jobs")
     .update({
-      lost_at: lostAt,
+      lost_at: current.lost_at ?? lostAt,
       lost_reason: lostReason,
+      revenue_cents: 0,
       status: "lost",
     })
     .eq("id", jobId);
@@ -977,7 +1040,7 @@ export async function markJobLost(formData: FormData) {
     eventType: "lost",
     jobId,
     message: `Marked lost: ${lostReason.replace(/_/g, " ")}.`,
-    metadata: { from: current.status, lost_at: lostAt, lost_reason: lostReason, to: "lost" },
+    metadata: { from: current.status, lost_at: current.lost_at ?? lostAt, lost_reason: lostReason, to: "lost" },
     userId,
   });
 
@@ -1041,7 +1104,7 @@ export async function saveQuote(formData: FormData) {
   if ((quote.status as QuoteStatus) === "accepted") {
     const { error: jobError } = await supabase
       .from("jobs")
-      .update({ price_cents: amountCents })
+      .update({ price_cents: amountCents, revenue_cents: amountCents })
       .eq("id", jobId)
       .eq("business_id", job.business_id);
 
@@ -1101,8 +1164,10 @@ export async function markQuoteSent(formData: FormData) {
 
   if (["lead", "contacted", "quoted"].includes(job.status as JobStatus)) {
     const jobUpdate = statusTransitionUpdate({
+      currentCompletedAt: job.completed_at,
       currentFirstContactAt: job.first_contact_at,
       currentQuoteSentAt: job.quote_sent_at,
+      currentWonAt: job.won_at,
       nextStatus: "quoted",
     });
     const { error: jobError } = await supabase.from("jobs").update(jobUpdate).eq("id", jobId);
@@ -1164,17 +1229,22 @@ export async function markQuoteAccepted(formData: FormData) {
 
   const statusUpdate = ["lead", "contacted", "quoted"].includes(job.status as JobStatus)
     ? statusTransitionUpdate({
+        currentCompletedAt: job.completed_at,
         currentFirstContactAt: job.first_contact_at,
         currentQuoteSentAt: job.quote_sent_at,
+        currentWonAt: job.won_at,
         nextStatus: "quoted",
       })
     : {};
+  const wonAt = job.won_at ?? new Date().toISOString();
   const { error: jobError } = await supabase
     .from("jobs")
     .update({
       ...statusUpdate,
       next_follow_up_at: null,
       price_cents: quote.amount_cents,
+      revenue_cents: quote.amount_cents,
+      won_at: wonAt,
     })
     .eq("id", jobId);
 
@@ -1187,7 +1257,7 @@ export async function markQuoteAccepted(formData: FormData) {
     eventType: "quote_accepted",
     jobId,
     message: `Quote accepted for ${formatMoney(quote.amount_cents)}.`,
-    metadata: { accepted_at: acceptedAt, amount_cents: quote.amount_cents, quote_id: quote.id, sent_at: sentAt, status: "accepted" },
+    metadata: { accepted_at: acceptedAt, amount_cents: quote.amount_cents, quote_id: quote.id, sent_at: sentAt, status: "accepted", won_at: wonAt },
     userId,
   });
 

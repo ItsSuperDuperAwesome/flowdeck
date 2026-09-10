@@ -107,7 +107,7 @@ export default async function CustomerDetail({
 
   const { data: jobRows } = await supabase
     .from("jobs")
-    .select("id, business_id, customer_id, title, description, status, price_cents, scheduled_start, scheduled_end, job_address, internal_notes, created_at, updated_at, customers(id, business_id, name, email, phone, address_line1, address_line2, city, state, postal_code, notes, created_at, updated_at)")
+    .select("id, business_id, customer_id, title, description, status, price_cents, scheduled_start, scheduled_end, job_address, internal_notes, source, project_type, preferred_date, square_feet, budget_range, first_contact_at, quote_sent_at, won_at, next_follow_up_at, lost_at, completed_at, lost_reason, revenue_cents, intake_data, created_at, updated_at, customers(id, business_id, name, email, phone, address_line1, address_line2, city, state, postal_code, notes, created_at, updated_at)")
     .eq("customer_id", id)
     .order("scheduled_start", { ascending: false, nullsFirst: false });
 
@@ -124,7 +124,7 @@ export default async function CustomerDetail({
     active: activeJobs.length,
     completed: jobs.filter((job) => job.status === "completed").length,
     total: jobs.length,
-    value: jobs.reduce((sum, job) => sum + job.price_cents, 0),
+    value: jobs.reduce((sum, job) => sum + job.revenue_cents, 0),
   };
   const lastJob = jobs[0]?.scheduled_start ?? jobs[0]?.created_at ?? null;
   const customers = ((customerRows ?? []) as Customer[]).map((row) => ({
@@ -240,7 +240,7 @@ export default async function CustomerDetail({
                         <span className={`status-pill status-${job.status}`}>{statusLabels[job.status]}</span>
                       </td>
                       <td>{job.scheduled_start ? dateTimeLabel(job.scheduled_start) : "Unscheduled"}</td>
-                      <td>{money(job.price_cents)}</td>
+                      <td>{money(job.revenue_cents)}</td>
                       <td>
                         <Link className="link-button" href={`/jobs/${job.id}`}>
                           Open

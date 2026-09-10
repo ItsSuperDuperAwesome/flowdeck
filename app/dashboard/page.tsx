@@ -58,7 +58,7 @@ export default async function Dashboard({
       ? await supabase
         .from("jobs")
         .select(
-          "id, business_id, customer_id, title, description, status, price_cents, scheduled_start, scheduled_end, job_address, internal_notes, source, project_type, preferred_date, square_feet, budget_range, first_contact_at, quote_sent_at, next_follow_up_at, lost_at, lost_reason, intake_data, created_at, updated_at, customers(id, business_id, name, email, phone, address_line1, address_line2, city, state, postal_code, notes, created_at, updated_at)",
+          "id, business_id, customer_id, title, description, status, price_cents, scheduled_start, scheduled_end, job_address, internal_notes, source, project_type, preferred_date, square_feet, budget_range, first_contact_at, quote_sent_at, won_at, next_follow_up_at, lost_at, completed_at, lost_reason, revenue_cents, intake_data, created_at, updated_at, customers(id, business_id, name, email, phone, address_line1, address_line2, city, state, postal_code, notes, created_at, updated_at)",
         )
         .eq("business_id", business.id)
         .order("scheduled_start", { ascending: true, nullsFirst: false })
@@ -170,7 +170,7 @@ function buildCustomerSummaries(customers: Customer[], jobs: Job[]): CustomerSum
       completed_jobs: customerJobs.filter((job) => job.status === "completed").length,
       job_count: customerJobs.length,
       last_job_date: sortedJobs[0]?.scheduled_start ?? sortedJobs[0]?.created_at ?? null,
-      lifetime_value_cents: customerJobs.reduce((sum, job) => sum + job.price_cents, 0),
+      lifetime_value_cents: customerJobs.reduce((sum, job) => sum + job.revenue_cents, 0),
     };
   });
 }
