@@ -1,0 +1,1519 @@
+"use server";
+
+import type { IntakeFieldType, JobFileCategory, JobStatus, QuoteStatus } from "@/lib/job-tracker/types";
+import { createClient } from "@/lib/supabase/server";
+import { revalidatePath } from "next/cache";
+import { redirect } from "next/navigation";
+
+const validStatuses: JobStatus[] = ["lead", "contacted", "quoted", "scheduled", "in_progress", "completed", "lost"];
+const validQuoteStatuses: QuoteStatus[] = ["draft", "sent", "accepted", "declined"];
+const validIntakeFieldTypes: IntakeFieldType[] = ["short_text", "long_text", "number", "select", "checkbox", "date"];
+const validLostReasons = ["price", "no_response", "competitor", "timing", "canceled_project", "not_qualified", "other"];
+const confirmedStatuses: JobStatus[] = ["scheduled", "in_progress", "completed"];
+const maxPhotoCount = 5;
+const maxPhotoSize = 10 * 1024 * 1024;
+const validPhotoTypes = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
+const validPhotoCategories: JobFileCategory[] = ["before", "damage", "prep", "progress", "completed", "other"];
+
+type ParsedIntakeField =
+  | { error: string }
+  | {
+      field: {
+        enabled: boolean;
+        field_key: string;
+        field_type: IntakeFieldType;
+        label: string;
+        options: string[];
+        required: boolean;
+      };
+    };
+
+function message(value: string) {
+  return encodeURIComponent(value);
+}
+
+function clean(value: FormDataEntryValue | null) {
+  return String(value ?? "").trim();
+}
+
+function optional(value: FormDataEntryValue | null) {
+  const cleaned = clean(value);
+  return cleaned || null;
+}
+
+function moneyToCents(value: FormDataEntryValue | null) {
+  const amount = Number(String(value ?? "0").replace(/[$,]/g, ""));
+  return Number.isFinite(amount) ? Math.max(0, Math.round(amount * 100)) : 0;
+}
+
+function extensionForMime(type: string) {
+  return {
+    "image/gif": "gif",
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+  }[type] ?? "img";
+}
+
+function displayFileName(name: string) {
+  return name
+    .replace(/[^\w.\- ]+/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120) || "Job photo";
+}
+
+function validatePhotoFiles(files: File[]) {
+  if (!files.length) {
+    return "Choose at least one photo.";
+  }
+
+  if (files.length > maxPhotoCount) {
+    return `Upload ${maxPhotoCount} photos or fewer at a time.`;
+  }
+
+  for (const file of files) {
+    if (!validPhotoTypes.has(file.type)) {
+      return "Photos must be JPG, PNG, WebP, or GIF images.";
+    }
+
+    if (file.size <= 0 || file.size > maxPhotoSize) {
+      return "Each photo must be 10 MB or smaller.";
+    }
+  }
+
+  return null;
+}
+
+function formatMoney(cents: number) {
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    maximumFractionDigits: 0,
+  }).format(cents / 100);
+}
+
+function formatActivityDateTime(value: string) {
+  const date = new Date(value);
+  const dateText = new Intl.DateTimeFormat("en-US", {
+    timeZone: "UTC",
+    month: "short",
+    day: "numeric",
+  }).format(date);
+  const timeText = new Intl.DateTimeFormat("en-US", {
+    timeZone: "UTC",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(date);
+
+  return `${dateText} at ${timeText}`;
+}
+
+function formatStatus(status: JobStatus) {
+  return {
+    lead: "Lead",
+    contacted: "Contacted",
+    quoted: "Quoted",
+    scheduled: "Scheduled",
+    in_progress: "In Progress",
+    completed: "Completed",
+    lost: "Lost",
+  }[status];
+}
+
+function scheduleValue(date: FormDataEntryValue | null, time: FormDataEntryValue | null) {
+  const day = clean(date);
+  const clock = clean(time) || "09:00";
+
+  if (!day) {
+    return null;
+  }
+
+  return `${day}T${clock}:00`;
+}
+
+function dateTimeLocalValue(value: FormDataEntryValue | null) {
+  const cleaned = clean(value);
+  return cleaned ? `${cleaned}:00` : null;
+}
+
+function normalizeScheduledEnd(start: string | null, end: string | null) {
+  if (!start || !end) {
+    return end;
+  }
+
+  return new Date(end).getTime() >= new Date(start).getTime() ? end : null;
+}
+
+function needsConfirmedSchedule(status: JobStatus) {
+  return confirmedStatuses.includes(status);
+}
+
+function isClosedStatus(status: JobStatus) {
+  return status === "completed" || status === "lost";
+}
+
+function statusTransitionUpdate(input: {
+  currentFirstContactAt?: string | null;
+  currentQuoteSentAt?: string | null;
+  nextStatus: JobStatus;
+}) {
+  const now = new Date().toISOString();
+  const update: Record<string, string | null> = {
+    status: input.nextStatus,
+  };
+
+  if (input.nextStatus === "contacted" && !input.currentFirstContactAt) {
+    update.first_contact_at = now;
+  }
+
+  if (input.nextStatus === "quoted") {
+    if (!input.currentFirstContactAt) {
+      update.first_contact_at = now;
+    }
+
+    if (!input.currentQuoteSentAt) {
+      update.quote_sent_at = now;
+    }
+  }
+
+  if (input.nextStatus === "scheduled" || input.nextStatus === "in_progress" || input.nextStatus === "completed" || input.nextStatus === "lost") {
+    update.next_follow_up_at = null;
+  }
+
+  if (input.nextStatus === "lost") {
+    update.lost_at = now;
+  }
+
+  if (input.nextStatus !== "lost") {
+    update.lost_at = null;
+    update.lost_reason = null;
+  }
+
+  return update;
+}
+
+function statusActivityMessage(from: JobStatus, to: JobStatus) {
+  if (to === "contacted") {
+    return "Customer contacted.";
+  }
+
+  if (to === "quoted") {
+    return "Job moved to quoted.";
+  }
+
+  if (to === "scheduled") {
+    return "Job scheduled.";
+  }
+
+  if (to === "in_progress") {
+    return "Job started.";
+  }
+
+  if (to === "completed") {
+    return "Job completed.";
+  }
+
+  if (to === "lost") {
+    return "Job marked lost.";
+  }
+
+  return `Status changed from ${formatStatus(from)} to ${formatStatus(to)}.`;
+}
+
+async function requireUser() {
+  const supabase = await createClient();
+  const { data, error } = await supabase.auth.getClaims();
+
+  if (error || !data?.claims?.sub) {
+    redirect("/");
+  }
+
+  return {
+    supabase,
+    userId: data.claims.sub,
+  };
+}
+
+async function logActivity(input: {
+  businessId: string;
+  eventType: string;
+  jobId: string;
+  message: string;
+  metadata?: Record<string, unknown>;
+  userId: string;
+}) {
+  const supabase = await createClient();
+  const { error } = await supabase.from("job_activity").insert({
+    business_id: input.businessId,
+    event_type: input.eventType,
+    job_id: input.jobId,
+    message: input.message,
+    metadata: input.metadata ?? {},
+    user_id: input.userId,
+  });
+
+  if (error) {
+    throw new Error(`Could not log job activity: ${error.message}`);
+  }
+}
+
+async function requireBusinessId() {
+  const { supabase } = await requireUser();
+  const { data } = await supabase.from("business_members").select("business_id").limit(1).single();
+
+  if (!data?.business_id) {
+    redirect("/dashboard");
+  }
+
+  return data.business_id as string;
+}
+
+async function requireBusinessAccess(businessId: string) {
+  const { supabase, userId } = await requireUser();
+  const { data, error } = await supabase
+    .from("business_members")
+    .select("business_id")
+    .eq("business_id", businessId)
+    .limit(1)
+    .single();
+
+  if (error || !data?.business_id) {
+    redirect(`/dashboard?view=Settings&message=${message("Could not access that workspace.")}`);
+  }
+
+  return { businessId: data.business_id as string, supabase, userId };
+}
+
+function fieldKeyFromLabel(label: string) {
+  return label
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 40);
+}
+
+function parseIntakeOptions(value: FormDataEntryValue | null) {
+  return clean(value)
+    .split(/\r?\n|,/)
+    .map((option) => option.trim())
+    .filter(Boolean)
+    .slice(0, 20);
+}
+
+function parseIntakeField(formData: FormData): ParsedIntakeField {
+  const label = clean(formData.get("label")).slice(0, 80);
+  const fieldType = clean(formData.get("fieldType")) as IntakeFieldType;
+  const fieldKey = (clean(formData.get("fieldKey")) || fieldKeyFromLabel(label)).toLowerCase();
+  const options = parseIntakeOptions(formData.get("options"));
+
+  if (!label) {
+    return { error: "Field label is required." };
+  }
+
+  if (!/^[a-z][a-z0-9_]{1,40}$/.test(fieldKey)) {
+    return { error: "Use a stable key like project_goal or garage_size." };
+  }
+
+  if (!validIntakeFieldTypes.includes(fieldType)) {
+    return { error: "Choose a supported field type." };
+  }
+
+  if (fieldType === "select" && options.length === 0) {
+    return { error: "Select fields need at least one option." };
+  }
+
+  return {
+    field: {
+      enabled: formData.get("enabled") === "on",
+      field_key: fieldKey,
+      field_type: fieldType,
+      label,
+      options,
+      required: formData.get("required") === "on",
+    },
+  };
+}
+
+async function requireJobForQuote(jobId: string) {
+  const { supabase, userId } = await requireUser();
+  const { data: job, error } = await supabase
+    .from("jobs")
+    .select("id, business_id, status, price_cents, first_contact_at, quote_sent_at")
+    .eq("id", jobId)
+    .single();
+
+  if (error || !job) {
+    redirect(`/dashboard?message=${message(error?.message ?? "Could not load that job.")}`);
+  }
+
+  return { job, supabase, userId };
+}
+
+async function requireQuoteForJob(quoteId: string, jobId: string) {
+  const { supabase, userId } = await requireUser();
+  const { data: quote, error: quoteError } = await supabase
+    .from("quotes")
+    .select("id, business_id, job_id, amount_cents, status, sent_at, accepted_at, declined_at")
+    .eq("id", quoteId)
+    .eq("job_id", jobId)
+    .single();
+
+  if (quoteError || !quote) {
+    redirect(`/jobs/${jobId}?message=${message(quoteError?.message ?? "Could not load that quote.")}`);
+  }
+
+  const { data: job, error: jobError } = await supabase
+    .from("jobs")
+    .select("id, business_id, status, price_cents, first_contact_at, quote_sent_at")
+    .eq("id", jobId)
+    .eq("business_id", quote.business_id)
+    .single();
+
+  if (jobError || !job) {
+    redirect(`/jobs/${jobId}?message=${message(jobError?.message ?? "Could not load that job.")}`);
+  }
+
+  return { job, quote, supabase, userId };
+}
+
+export async function createBusiness(formData: FormData) {
+  const name = clean(formData.get("name"));
+
+  if (!name) {
+    redirect(`/dashboard?message=${message("Business name is required.")}`);
+  }
+
+  const { supabase, userId } = await requireUser();
+
+  const { data: business, error: businessError } = await supabase
+    .from("businesses")
+    .insert({
+      name,
+      created_by: userId,
+    })
+    .select("id")
+    .single();
+
+  if (businessError || !business) {
+    redirect(
+      `/dashboard?message=${message(
+        businessError?.message ?? "Could not create the business.",
+      )}`,
+    );
+  }
+
+  const { error: memberError } = await supabase.from("business_members").insert({
+    business_id: business.id,
+    user_id: userId,
+    role: "owner",
+  });
+
+  if (memberError) {
+    redirect(`/dashboard?message=${message(memberError.message)}`);
+  }
+
+  revalidatePath("/dashboard");
+  redirect("/dashboard");
+}
+
+export async function createCustomer(formData: FormData) {
+  const businessId = clean(formData.get("businessId")) || (await requireBusinessId());
+  const name = clean(formData.get("name"));
+
+  if (!name) {
+    redirect(`/dashboard?message=${message("Customer name is required.")}`);
+  }
+
+  const { supabase } = await requireUser();
+  const { data, error } = await supabase
+    .from("customers")
+    .insert({
+      address_line1: optional(formData.get("addressLine1")),
+      address_line2: optional(formData.get("addressLine2")),
+      business_id: businessId,
+      city: optional(formData.get("city")),
+      email: optional(formData.get("email")),
+      name,
+      notes: optional(formData.get("notes")),
+      phone: optional(formData.get("phone")),
+      postal_code: optional(formData.get("postalCode")),
+      state: optional(formData.get("state")),
+    })
+    .select("id")
+    .single();
+
+  if (error || !data) {
+    redirect(`/dashboard?message=${message(error?.message ?? "Could not create customer.")}`);
+  }
+
+  revalidatePath("/dashboard");
+  redirect(`/customers/${data.id}?message=${message("Customer created.")}`);
+}
+
+export async function updateCustomer(formData: FormData) {
+  const customerId = clean(formData.get("customerId"));
+
+  if (!customerId) {
+    redirect(`/dashboard?message=${message("Could not find that customer.")}`);
+  }
+
+  await updateCustomerRecord(customerId, formData);
+}
+
+export async function updateCustomerById(customerId: string, formData: FormData) {
+  await updateCustomerRecord(customerId, formData);
+}
+
+export async function updateCustomerByIdWithContactFallback(customerId: string, currentPhone: string, currentEmail: string, formData: FormData) {
+  await updateCustomerRecord(customerId, formData, { currentEmail, currentPhone });
+}
+
+async function updateCustomerRecord(
+  customerId: string,
+  formData: FormData,
+  fallback: { currentEmail: string; currentPhone: string } | null = null,
+) {
+  const name = clean(formData.get("name"));
+
+  if (!name) {
+    redirect(`/customers/${customerId}?message=${message("Customer name is required.")}`);
+  }
+
+  const { supabase } = await requireUser();
+  const { error } = await supabase
+    .from("customers")
+    .update({
+      address_line1: optional(formData.get("addressLine1")),
+      address_line2: optional(formData.get("addressLine2")),
+      city: optional(formData.get("city")),
+      email: optional(formData.get("customerEmail") ?? formData.get("email")) ?? fallback?.currentEmail ?? null,
+      name,
+      notes: optional(formData.get("notes")),
+      phone: optional(formData.get("customerPhone") ?? formData.get("phone")) ?? fallback?.currentPhone ?? null,
+      postal_code: optional(formData.get("postalCode")),
+      state: optional(formData.get("state")),
+    })
+    .eq("id", customerId);
+
+  if (error) {
+    redirect(`/customers/${customerId}?message=${message(error.message)}`);
+  }
+
+  revalidatePath("/dashboard");
+  revalidatePath(`/customers/${customerId}`);
+  redirect(`/customers/${customerId}?message=${message("Customer updated.")}`);
+}
+
+export async function createJob(formData: FormData) {
+  const businessId = clean(formData.get("businessId")) || (await requireBusinessId());
+  const customerId = clean(formData.get("customerId"));
+  const title = clean(formData.get("title"));
+  const status = clean(formData.get("status")) as JobStatus;
+  const scheduledStart = scheduleValue(formData.get("scheduledDate"), formData.get("scheduledTime"));
+  const submittedEnd = scheduleValue(formData.get("scheduledEndDate"), formData.get("scheduledEndTime"));
+  const scheduledEnd = normalizeScheduledEnd(scheduledStart, submittedEnd);
+
+  if (!businessId || !customerId || !title) {
+    redirect(`/dashboard?message=${message("Customer and job title are required.")}`);
+  }
+
+  if (!validStatuses.includes(status)) {
+    redirect(`/dashboard?message=${message("That status is not supported.")}`);
+  }
+
+  if (needsConfirmedSchedule(status) && !scheduledStart) {
+    redirect(`/dashboard?message=${message("Scheduled, active, and completed jobs need a confirmed start date.")}`);
+  }
+
+  if (submittedEnd && !scheduledEnd) {
+    redirect(`/dashboard?message=${message("End time cannot be earlier than the start time.")}`);
+  }
+
+  const { supabase, userId } = await requireUser();
+  const { data: customer } = await supabase
+    .from("customers")
+    .select("name, address_line1, address_line2, city, state, postal_code")
+    .eq("id", customerId)
+    .eq("business_id", businessId)
+    .single();
+
+  const customerAddress = [
+    customer?.address_line1,
+    customer?.address_line2,
+    customer?.city,
+    customer?.state,
+    customer?.postal_code,
+  ]
+    .filter(Boolean)
+    .join(", ");
+  const address = optional(formData.get("jobAddress")) ?? (customerAddress || null);
+
+  const { data: job, error } = await supabase
+    .from("jobs")
+    .insert({
+      business_id: businessId,
+      customer_id: customerId,
+      customer_name: customer?.name ?? "Customer",
+      description: optional(formData.get("description")),
+      internal_notes: optional(formData.get("internalNotes")),
+      job_address: address,
+      job_title: title,
+      price_cents: moneyToCents(formData.get("price")),
+      scheduled_date: scheduledStart ? scheduledStart.slice(0, 10) : null,
+      scheduled_end: scheduledEnd,
+      scheduled_start: scheduledStart,
+      source: "manual",
+      status,
+      title,
+    })
+    .select("id")
+    .single();
+
+  if (error || !job) {
+    redirect(`/dashboard?message=${message(error?.message ?? "Could not create job.")}`);
+  }
+
+  await logActivity({
+    businessId,
+    eventType: "job_created",
+    jobId: job.id,
+    message: "Job created.",
+    userId,
+  });
+
+  if (scheduledStart) {
+    await logActivity({
+      businessId,
+      eventType: "scheduled",
+      jobId: job.id,
+      message: `Scheduled for ${formatActivityDateTime(scheduledStart)}.`,
+      metadata: { scheduled_start: scheduledStart },
+      userId,
+    });
+  }
+
+  revalidatePath("/dashboard");
+  redirect(`/jobs/${job.id}?message=${message("Job created.")}`);
+}
+
+export async function updateJob(formData: FormData) {
+  const jobId = clean(formData.get("jobId"));
+
+  if (!jobId) {
+    redirect(`/dashboard?message=${message("Could not find that job.")}`);
+  }
+
+  const customerId = clean(formData.get("customerId"));
+  const title = clean(formData.get("title"));
+  const status = clean(formData.get("status")) as JobStatus;
+  const scheduledStart = scheduleValue(formData.get("scheduledDate"), formData.get("scheduledTime"));
+  const submittedEnd = scheduleValue(formData.get("scheduledEndDate"), formData.get("scheduledEndTime"));
+  const scheduledEnd = normalizeScheduledEnd(scheduledStart, submittedEnd);
+  const priceCents = moneyToCents(formData.get("price"));
+
+  if (!customerId || !title) {
+    redirect(`/jobs/${jobId}?message=${message("Customer and job title are required.")}`);
+  }
+
+  if (!validStatuses.includes(status)) {
+    redirect(`/jobs/${jobId}?message=${message("That status is not supported.")}`);
+  }
+
+  if (needsConfirmedSchedule(status) && !scheduledStart) {
+    redirect(`/jobs/${jobId}?message=${message("Scheduled, active, and completed jobs need a confirmed start date.")}`);
+  }
+
+  if (submittedEnd && !scheduledEnd) {
+    redirect(`/jobs/${jobId}?message=${message("End time cannot be earlier than the start time.")}`);
+  }
+
+  const { supabase, userId } = await requireUser();
+  const { data: current, error: currentError } = await supabase
+    .from("jobs")
+    .select("business_id, customer_id, title, status, price_cents, scheduled_start, first_contact_at, quote_sent_at, lost_reason")
+    .eq("id", jobId)
+    .single();
+
+  if (currentError || !current) {
+    redirect(`/dashboard?message=${message(currentError?.message ?? "Could not load that job.")}`);
+  }
+
+  if (status === "lost" && !current.lost_reason) {
+    redirect(`/jobs/${jobId}?message=${message("Use Mark Lost so a lost reason is recorded.")}`);
+  }
+
+  const { data: customer } = await supabase
+    .from("customers")
+    .select("name")
+    .eq("id", customerId)
+    .eq("business_id", current.business_id)
+    .single();
+
+  const transitionUpdate = current.status !== status
+    ? statusTransitionUpdate({
+        currentFirstContactAt: current.first_contact_at,
+        currentQuoteSentAt: current.quote_sent_at,
+        nextStatus: status,
+      })
+    : {};
+
+  const { error } = await supabase
+    .from("jobs")
+    .update({
+      customer_id: customerId,
+      customer_name: customer?.name ?? "Customer",
+      description: optional(formData.get("description")),
+      internal_notes: optional(formData.get("internalNotes")),
+      job_address: optional(formData.get("jobAddress")),
+      job_title: title,
+      price_cents: priceCents,
+      scheduled_date: scheduledStart ? scheduledStart.slice(0, 10) : null,
+      scheduled_end: scheduledEnd,
+      scheduled_start: scheduledStart,
+      status,
+      title,
+      ...transitionUpdate,
+    })
+    .eq("id", jobId);
+
+  if (error) {
+    redirect(`/jobs/${jobId}?message=${message(error.message)}`);
+  }
+
+  const activity = [];
+
+  if (current.status !== status) {
+    activity.push({
+      eventType: "status_changed",
+      message: statusActivityMessage(current.status as JobStatus, status),
+      metadata: { from: current.status, to: status },
+    });
+  }
+
+  if (current.scheduled_start !== scheduledStart) {
+    activity.push({
+      eventType: "schedule_changed",
+      message: scheduledStart ? `Scheduled for ${formatActivityDateTime(scheduledStart)}.` : "Schedule cleared.",
+      metadata: { from: current.scheduled_start, to: scheduledStart },
+    });
+  }
+
+  if (current.price_cents !== priceCents) {
+    activity.push({
+      eventType: "value_changed",
+      message: `Job value changed from ${formatMoney(current.price_cents)} to ${formatMoney(priceCents)}.`,
+      metadata: { from: current.price_cents, to: priceCents },
+    });
+  }
+
+  if (current.customer_id !== customerId) {
+    activity.push({
+      eventType: "customer_changed",
+      message: `Customer changed to ${customer?.name ?? "selected customer"}.`,
+      metadata: { from: current.customer_id, to: customerId },
+    });
+  }
+
+  await Promise.all(
+    activity.map((entry) =>
+      logActivity({
+        businessId: current.business_id,
+        eventType: entry.eventType,
+        jobId,
+        message: entry.message,
+        metadata: entry.metadata,
+        userId,
+      }),
+    ),
+  );
+
+  revalidatePath("/dashboard");
+  revalidatePath(`/jobs/${jobId}`);
+  redirect(`/jobs/${jobId}?message=${message("Job updated.")}`);
+}
+
+export async function updateJobStatus(formData: FormData) {
+  const jobId = clean(formData.get("jobId"));
+  const status = clean(formData.get("status")) as JobStatus;
+
+  if (!jobId) {
+    redirect(`/dashboard?message=${message("Could not find that job.")}`);
+  }
+
+  if (!validStatuses.includes(status)) {
+    redirect(`/dashboard?message=${message("That status is not supported.")}`);
+  }
+
+  const { supabase, userId } = await requireUser();
+  const { data: current, error: currentError } = await supabase
+    .from("jobs")
+    .select("business_id, status, scheduled_start, first_contact_at, quote_sent_at")
+    .eq("id", jobId)
+    .single();
+
+  if (currentError || !current) {
+    redirect(`/dashboard?message=${message(currentError?.message ?? "Could not load that job.")}`);
+  }
+
+  if (status === "lost" && current.status !== "lost") {
+    redirect(`/jobs/${jobId}?message=${message("Use Mark Lost so a lost reason is recorded.")}`);
+  }
+
+  if (needsConfirmedSchedule(status) && !current.scheduled_start) {
+    redirect(`/jobs/${jobId}?message=${message("Set a confirmed schedule before moving this job into scheduled work.")}`);
+  }
+
+  const update = statusTransitionUpdate({
+    currentFirstContactAt: current.first_contact_at,
+    currentQuoteSentAt: current.quote_sent_at,
+    nextStatus: status,
+  });
+
+  const { error } = await supabase.from("jobs").update(update).eq("id", jobId);
+
+  if (error) {
+    redirect(`/dashboard?message=${message(error.message)}`);
+  }
+
+  if (current.status !== status) {
+    await logActivity({
+      businessId: current.business_id,
+      eventType: "status_changed",
+      jobId,
+      message: statusActivityMessage(current.status as JobStatus, status),
+      metadata: { from: current.status, to: status },
+      userId,
+    });
+  }
+
+  revalidatePath("/dashboard");
+  revalidatePath(`/jobs/${jobId}`);
+  redirect(clean(formData.get("returnTo")) || "/dashboard");
+}
+
+export async function markJobContacted(formData: FormData) {
+  const jobId = clean(formData.get("jobId"));
+
+  if (!jobId) {
+    redirect(`/dashboard?message=${message("Could not find that job.")}`);
+  }
+
+  const { supabase, userId } = await requireUser();
+  const { data: current, error: currentError } = await supabase
+    .from("jobs")
+    .select("business_id, status, first_contact_at, quote_sent_at, scheduled_start")
+    .eq("id", jobId)
+    .single();
+
+  if (currentError || !current) {
+    redirect(`/dashboard?message=${message(currentError?.message ?? "Could not load that job.")}`);
+  }
+
+  const nextStatus = current.status === "lead" ? "contacted" : current.status;
+  const update = statusTransitionUpdate({
+    currentFirstContactAt: current.first_contact_at,
+    currentQuoteSentAt: current.quote_sent_at,
+    nextStatus,
+  });
+  const { error } = await supabase
+    .from("jobs")
+    .update(update)
+    .eq("id", jobId);
+
+  if (error) {
+    redirect(`/jobs/${jobId}?message=${message(error.message)}`);
+  }
+
+  await logActivity({
+    businessId: current.business_id,
+    eventType: "contacted",
+    jobId,
+    message: current.first_contact_at ? "Customer contact confirmed." : "First contact recorded.",
+    metadata: { first_contact_at: update.first_contact_at ?? current.first_contact_at, from: current.status, to: nextStatus },
+    userId,
+  });
+
+  revalidatePath("/dashboard");
+  revalidatePath(`/jobs/${jobId}`);
+  redirect(`/jobs/${jobId}?message=${message("Contact recorded.")}`);
+}
+
+export async function markJobQuoted(formData: FormData) {
+  const jobId = clean(formData.get("jobId"));
+
+  if (!jobId) {
+    redirect(`/dashboard?message=${message("Could not find that job.")}`);
+  }
+
+  const { supabase, userId } = await requireUser();
+  const { data: current, error: currentError } = await supabase
+    .from("jobs")
+    .select("business_id, status, first_contact_at, quote_sent_at, scheduled_start")
+    .eq("id", jobId)
+    .single();
+
+  if (currentError || !current) {
+    redirect(`/dashboard?message=${message(currentError?.message ?? "Could not load that job.")}`);
+  }
+
+  if (current.status !== "lead" && current.status !== "contacted" && current.status !== "quoted") {
+    redirect(`/jobs/${jobId}?message=${message("Only active sales jobs can be moved to quoted.")}`);
+  }
+
+  const update = statusTransitionUpdate({
+    currentFirstContactAt: current.first_contact_at,
+    currentQuoteSentAt: current.quote_sent_at,
+    nextStatus: "quoted",
+  });
+  const { error } = await supabase
+    .from("jobs")
+    .update(update)
+    .eq("id", jobId);
+
+  if (error) {
+    redirect(`/jobs/${jobId}?message=${message(error.message)}`);
+  }
+
+  await logActivity({
+    businessId: current.business_id,
+    eventType: "quoted",
+    jobId,
+    message: current.quote_sent_at ? "Quote status confirmed." : "Job moved to quoted.",
+    metadata: { quote_sent_at: update.quote_sent_at ?? current.quote_sent_at, from: current.status, to: "quoted" },
+    userId,
+  });
+
+  revalidatePath("/dashboard");
+  revalidatePath(`/jobs/${jobId}`);
+  redirect(`/jobs/${jobId}?message=${message("Quote recorded.")}`);
+}
+
+export async function setJobFollowUp(formData: FormData) {
+  const jobId = clean(formData.get("jobId"));
+  const nextFollowUpAt = dateTimeLocalValue(formData.get("nextFollowUpAt"));
+
+  if (!jobId || !nextFollowUpAt) {
+    redirect(`/jobs/${jobId || ""}?message=${message("Choose a follow-up date and time.")}`);
+  }
+
+  if (new Date(nextFollowUpAt).getTime() <= Date.now()) {
+    redirect(`/jobs/${jobId}?message=${message("Choose a future follow-up time.")}`);
+  }
+
+  const { supabase, userId } = await requireUser();
+  const { data: current, error: currentError } = await supabase
+    .from("jobs")
+    .select("business_id, next_follow_up_at")
+    .eq("id", jobId)
+    .single();
+
+  if (currentError || !current) {
+    redirect(`/dashboard?message=${message(currentError?.message ?? "Could not load that job.")}`);
+  }
+
+  const { error } = await supabase
+    .from("jobs")
+    .update({ next_follow_up_at: nextFollowUpAt })
+    .eq("id", jobId);
+
+  if (error) {
+    redirect(`/jobs/${jobId}?message=${message(error.message)}`);
+  }
+
+  await logActivity({
+    businessId: current.business_id,
+    eventType: "follow_up_set",
+    jobId,
+    message: `Follow-up set for ${formatActivityDateTime(nextFollowUpAt)}.`,
+    metadata: { from: current.next_follow_up_at, to: nextFollowUpAt },
+    userId,
+  });
+
+  revalidatePath("/dashboard");
+  revalidatePath(`/jobs/${jobId}`);
+  redirect(`/jobs/${jobId}?message=${message("Follow-up saved.")}`);
+}
+
+export async function markJobLost(formData: FormData) {
+  const jobId = clean(formData.get("jobId"));
+  const lostReason = clean(formData.get("lostReason"));
+
+  if (!jobId) {
+    redirect(`/dashboard?message=${message("Could not find that job.")}`);
+  }
+
+  if (!validLostReasons.includes(lostReason)) {
+    redirect(`/jobs/${jobId}?message=${message("Choose a lost reason.")}`);
+  }
+
+  const { supabase, userId } = await requireUser();
+  const { data: current, error: currentError } = await supabase
+    .from("jobs")
+    .select("business_id, status")
+    .eq("id", jobId)
+    .single();
+
+  if (currentError || !current) {
+    redirect(`/dashboard?message=${message(currentError?.message ?? "Could not load that job.")}`);
+  }
+
+  const lostAt = new Date().toISOString();
+  const { error } = await supabase
+    .from("jobs")
+    .update({
+      lost_at: lostAt,
+      lost_reason: lostReason,
+      status: "lost",
+    })
+    .eq("id", jobId);
+
+  if (error) {
+    redirect(`/jobs/${jobId}?message=${message(error.message)}`);
+  }
+
+  await logActivity({
+    businessId: current.business_id,
+    eventType: "lost",
+    jobId,
+    message: `Marked lost: ${lostReason.replace(/_/g, " ")}.`,
+    metadata: { from: current.status, lost_at: lostAt, lost_reason: lostReason, to: "lost" },
+    userId,
+  });
+
+  revalidatePath("/dashboard");
+  revalidatePath(`/jobs/${jobId}`);
+  redirect(`/jobs/${jobId}?message=${message("Job marked lost.")}`);
+}
+
+export async function saveQuote(formData: FormData) {
+  const jobId = clean(formData.get("jobId"));
+  const quoteId = clean(formData.get("quoteId"));
+  const amountCents = moneyToCents(formData.get("amount"));
+  const validUntil = optional(formData.get("validUntil"));
+
+  if (!jobId) {
+    redirect(`/dashboard?message=${message("Could not find that job.")}`);
+  }
+
+  if (amountCents <= 0) {
+    redirect(`/jobs/${jobId}?message=${message("Enter a quote amount greater than $0.")}`);
+  }
+
+  const { job, supabase, userId } = await requireJobForQuote(jobId);
+
+  if (isClosedStatus(job.status as JobStatus)) {
+    redirect(`/jobs/${jobId}?message=${message("Closed jobs cannot be quoted.")}`);
+  }
+
+  const quotePayload = {
+    amount_cents: amountCents,
+    notes: optional(formData.get("quoteNotes")),
+    valid_until: validUntil,
+  };
+
+  const query = quoteId
+    ? supabase
+        .from("quotes")
+        .update(quotePayload)
+        .eq("id", quoteId)
+        .eq("job_id", jobId)
+        .eq("business_id", job.business_id)
+        .select("id, status")
+        .single()
+    : supabase
+        .from("quotes")
+        .insert({
+          ...quotePayload,
+          business_id: job.business_id,
+          job_id: jobId,
+          status: "draft",
+        })
+        .select("id, status")
+        .single();
+
+  const { data: quote, error } = await query;
+
+  if (error || !quote) {
+    redirect(`/jobs/${jobId}?message=${message(error?.message ?? "Could not save quote.")}`);
+  }
+
+  if ((quote.status as QuoteStatus) === "accepted") {
+    const { error: jobError } = await supabase
+      .from("jobs")
+      .update({ price_cents: amountCents })
+      .eq("id", jobId)
+      .eq("business_id", job.business_id);
+
+    if (jobError) {
+      redirect(`/jobs/${jobId}?message=${message(jobError.message)}`);
+    }
+  }
+
+  await logActivity({
+    businessId: job.business_id,
+    eventType: quoteId ? "quote_updated" : "quote_created",
+    jobId,
+    message: quoteId ? `Quote updated to ${formatMoney(amountCents)}.` : `Quote draft created for ${formatMoney(amountCents)}.`,
+    metadata: { amount_cents: amountCents, quote_id: quote.id, status: quote.status, valid_until: validUntil },
+    userId,
+  });
+
+  revalidatePath("/dashboard");
+  revalidatePath(`/jobs/${jobId}`);
+  redirect(`/jobs/${jobId}?message=${message("Quote saved.")}`);
+}
+
+export async function markQuoteSent(formData: FormData) {
+  const jobId = clean(formData.get("jobId"));
+  const quoteId = clean(formData.get("quoteId"));
+
+  if (!jobId || !quoteId) {
+    redirect(`/jobs/${jobId || ""}?message=${message("Could not find that quote.")}`);
+  }
+
+  const { job, quote, supabase, userId } = await requireQuoteForJob(quoteId, jobId);
+  const currentQuoteStatus = quote.status as QuoteStatus;
+
+  if (isClosedStatus(job.status as JobStatus)) {
+    redirect(`/jobs/${jobId}?message=${message("Closed jobs cannot be quoted.")}`);
+  }
+
+  if (!validQuoteStatuses.includes(currentQuoteStatus) || currentQuoteStatus === "accepted" || currentQuoteStatus === "declined") {
+    redirect(`/jobs/${jobId}?message=${message("Only draft quotes can be marked sent.")}`);
+  }
+
+  const sentAt = quote.sent_at ?? new Date().toISOString();
+  const { error: quoteError } = await supabase
+    .from("quotes")
+    .update({
+      accepted_at: null,
+      declined_at: null,
+      sent_at: sentAt,
+      status: "sent",
+    })
+    .eq("id", quoteId)
+    .eq("job_id", jobId);
+
+  if (quoteError) {
+    redirect(`/jobs/${jobId}?message=${message(quoteError.message)}`);
+  }
+
+  if (["lead", "contacted", "quoted"].includes(job.status as JobStatus)) {
+    const jobUpdate = statusTransitionUpdate({
+      currentFirstContactAt: job.first_contact_at,
+      currentQuoteSentAt: job.quote_sent_at,
+      nextStatus: "quoted",
+    });
+    const { error: jobError } = await supabase.from("jobs").update(jobUpdate).eq("id", jobId);
+
+    if (jobError) {
+      redirect(`/jobs/${jobId}?message=${message(jobError.message)}`);
+    }
+  }
+
+  await logActivity({
+    businessId: quote.business_id,
+    eventType: "quote_sent",
+    jobId,
+    message: `Quote sent for ${formatMoney(quote.amount_cents)}.`,
+    metadata: { amount_cents: quote.amount_cents, quote_id: quote.id, sent_at: sentAt, status: "sent" },
+    userId,
+  });
+
+  revalidatePath("/dashboard");
+  revalidatePath(`/jobs/${jobId}`);
+  redirect(`/jobs/${jobId}?message=${message("Quote marked sent.")}`);
+}
+
+export async function markQuoteAccepted(formData: FormData) {
+  const jobId = clean(formData.get("jobId"));
+  const quoteId = clean(formData.get("quoteId"));
+
+  if (!jobId || !quoteId) {
+    redirect(`/jobs/${jobId || ""}?message=${message("Could not find that quote.")}`);
+  }
+
+  const { job, quote, supabase, userId } = await requireQuoteForJob(quoteId, jobId);
+  const currentQuoteStatus = quote.status as QuoteStatus;
+
+  if (isClosedStatus(job.status as JobStatus)) {
+    redirect(`/jobs/${jobId}?message=${message("Closed jobs cannot be quoted.")}`);
+  }
+
+  if (!validQuoteStatuses.includes(currentQuoteStatus) || currentQuoteStatus === "declined") {
+    redirect(`/jobs/${jobId}?message=${message("Declined quotes cannot be accepted. Save a new quote first.")}`);
+  }
+
+  const acceptedAt = quote.accepted_at ?? new Date().toISOString();
+  const sentAt = quote.sent_at ?? acceptedAt;
+  const { error: quoteError } = await supabase
+    .from("quotes")
+    .update({
+      accepted_at: acceptedAt,
+      declined_at: null,
+      sent_at: sentAt,
+      status: "accepted",
+    })
+    .eq("id", quoteId)
+    .eq("job_id", jobId);
+
+  if (quoteError) {
+    redirect(`/jobs/${jobId}?message=${message(quoteError.message)}`);
+  }
+
+  const statusUpdate = ["lead", "contacted", "quoted"].includes(job.status as JobStatus)
+    ? statusTransitionUpdate({
+        currentFirstContactAt: job.first_contact_at,
+        currentQuoteSentAt: job.quote_sent_at,
+        nextStatus: "quoted",
+      })
+    : {};
+  const { error: jobError } = await supabase
+    .from("jobs")
+    .update({
+      ...statusUpdate,
+      next_follow_up_at: null,
+      price_cents: quote.amount_cents,
+    })
+    .eq("id", jobId);
+
+  if (jobError) {
+    redirect(`/jobs/${jobId}?message=${message(jobError.message)}`);
+  }
+
+  await logActivity({
+    businessId: quote.business_id,
+    eventType: "quote_accepted",
+    jobId,
+    message: `Quote accepted for ${formatMoney(quote.amount_cents)}.`,
+    metadata: { accepted_at: acceptedAt, amount_cents: quote.amount_cents, quote_id: quote.id, sent_at: sentAt, status: "accepted" },
+    userId,
+  });
+
+  revalidatePath("/dashboard");
+  revalidatePath(`/jobs/${jobId}`);
+  redirect(`/jobs/${jobId}?message=${message("Quote accepted.")}`);
+}
+
+export async function markQuoteDeclined(formData: FormData) {
+  const jobId = clean(formData.get("jobId"));
+  const quoteId = clean(formData.get("quoteId"));
+
+  if (!jobId || !quoteId) {
+    redirect(`/jobs/${jobId || ""}?message=${message("Could not find that quote.")}`);
+  }
+
+  const { job, quote, supabase, userId } = await requireQuoteForJob(quoteId, jobId);
+  const currentQuoteStatus = quote.status as QuoteStatus;
+
+  if (isClosedStatus(job.status as JobStatus)) {
+    redirect(`/jobs/${jobId}?message=${message("Closed jobs cannot be quoted.")}`);
+  }
+
+  if (!validQuoteStatuses.includes(currentQuoteStatus) || currentQuoteStatus === "accepted") {
+    redirect(`/jobs/${jobId}?message=${message("Accepted quotes cannot be declined.")}`);
+  }
+
+  const declinedAt = quote.declined_at ?? new Date().toISOString();
+  const nextStatus = "declined" satisfies QuoteStatus;
+
+  if (!validQuoteStatuses.includes(nextStatus)) {
+    redirect(`/jobs/${jobId}?message=${message("That quote status is not supported.")}`);
+  }
+
+  const { error } = await supabase
+    .from("quotes")
+    .update({
+      accepted_at: null,
+      declined_at: declinedAt,
+      status: nextStatus,
+    })
+    .eq("id", quoteId)
+    .eq("job_id", jobId);
+
+  if (error) {
+    redirect(`/jobs/${jobId}?message=${message(error.message)}`);
+  }
+
+  await logActivity({
+    businessId: quote.business_id,
+    eventType: "quote_declined",
+    jobId,
+    message: `Quote declined for ${formatMoney(quote.amount_cents)}.`,
+    metadata: { amount_cents: quote.amount_cents, declined_at: declinedAt, quote_id: quote.id, status: nextStatus },
+    userId,
+  });
+
+  revalidatePath("/dashboard");
+  revalidatePath(`/jobs/${jobId}`);
+  redirect(`/jobs/${jobId}?message=${message("Quote declined.")}`);
+}
+
+export async function uploadJobPhotos(formData: FormData) {
+  const jobId = clean(formData.get("jobId"));
+  const category = clean(formData.get("category")) as JobFileCategory;
+  const files = formData.getAll("photos").filter((value): value is File => value instanceof File && value.size > 0);
+
+  if (!jobId) {
+    redirect(`/dashboard?message=${message("Could not find that job.")}`);
+  }
+
+  if (!validPhotoCategories.includes(category)) {
+    redirect(`/jobs/${jobId}?message=${message("Choose a valid photo category.")}`);
+  }
+
+  const validationError = validatePhotoFiles(files);
+
+  if (validationError) {
+    redirect(`/jobs/${jobId}?message=${message(validationError)}`);
+  }
+
+  const { supabase, userId } = await requireUser();
+  const { data: job, error: jobError } = await supabase
+    .from("jobs")
+    .select("id, business_id")
+    .eq("id", jobId)
+    .single();
+
+  if (jobError || !job) {
+    redirect(`/dashboard?message=${message(jobError?.message ?? "Could not load that job.")}`);
+  }
+
+  let uploadedCount = 0;
+
+  for (const file of files) {
+    const storagePath = `${job.business_id}/${job.id}/${category}/${crypto.randomUUID()}.${extensionForMime(file.type)}`;
+    const upload = await supabase.storage.from("job-files").upload(storagePath, await file.arrayBuffer(), {
+      contentType: file.type,
+      metadata: {
+        mimetype: file.type,
+        size: String(file.size),
+      },
+      upsert: false,
+    });
+
+    if (upload.error) {
+      redirect(`/jobs/${jobId}?message=${message("That photo could not be uploaded. Please try again.")}`);
+    }
+
+    const { error: metadataError } = await supabase.from("job_files").insert({
+      business_id: job.business_id,
+      category,
+      file_name: displayFileName(file.name),
+      job_id: job.id,
+      mime_type: file.type.toLowerCase(),
+      size_bytes: file.size,
+      source_context: "job_detail",
+      storage_bucket: "job-files",
+      storage_path: storagePath,
+    });
+
+    if (metadataError) {
+      await supabase.storage.from("job-files").remove([storagePath]);
+      redirect(`/jobs/${jobId}?message=${message("That photo could not be saved. Please try again.")}`);
+    }
+
+    uploadedCount += 1;
+  }
+
+  await logActivity({
+    businessId: job.business_id,
+    eventType: "photos_uploaded",
+    jobId,
+    message: uploadedCount === 1 ? "1 job photo uploaded." : `${uploadedCount} job photos uploaded.`,
+    metadata: { category, count: uploadedCount },
+    userId,
+  });
+
+  revalidatePath("/dashboard");
+  revalidatePath(`/jobs/${jobId}`);
+  redirect(`/jobs/${jobId}?message=${message(uploadedCount === 1 ? "Photo uploaded." : "Photos uploaded.")}`);
+}
+
+export async function updateBusiness(formData: FormData) {
+  const businessId = clean(formData.get("businessId"));
+  const name = clean(formData.get("name"));
+
+  if (!businessId || !name) {
+    redirect(`/dashboard?message=${message("Business name is required.")}`);
+  }
+
+  const { supabase } = await requireUser();
+  const { error } = await supabase.from("businesses").update({ name }).eq("id", businessId);
+
+  if (error) {
+    redirect(`/dashboard?message=${message(error.message)}`);
+  }
+
+  revalidatePath("/dashboard");
+  redirect(`/dashboard?message=${message("Workspace updated.")}`);
+}
+
+export async function updateIntakeSettings(formData: FormData) {
+  const businessId = clean(formData.get("businessId"));
+  const title = clean(formData.get("intakeTitle"));
+  const description = clean(formData.get("intakeDescription"));
+
+  if (!businessId) {
+    redirect(`/dashboard?message=${message("Could not find that workspace.")}`);
+  }
+
+  const { supabase } = await requireUser();
+  const { error } = await supabase
+    .from("businesses")
+    .update({
+      intake_form_description: description || "Share a few details and we will follow up with next steps.",
+      intake_form_enabled: formData.get("intakeEnabled") === "on",
+      intake_form_title: title || "Tell us about your project",
+    })
+    .eq("id", businessId);
+
+  if (error) {
+    redirect(`/dashboard?message=${message(error.message)}`);
+  }
+
+  revalidatePath("/dashboard");
+  redirect(`/dashboard?message=${message("Intake form settings saved.")}`);
+}
+
+export async function createIntakeField(formData: FormData) {
+  const businessId = clean(formData.get("businessId"));
+
+  if (!businessId) {
+    redirect(`/dashboard?view=Settings&message=${message("Could not find that workspace.")}`);
+  }
+
+  const parsed = parseIntakeField(formData);
+
+  if ("error" in parsed) {
+    redirect(`/dashboard?view=Settings&message=${message(parsed.error)}`);
+  }
+
+  const { supabase } = await requireBusinessAccess(businessId);
+  const { data: lastField } = await supabase
+    .from("intake_fields")
+    .select("sort_order")
+    .eq("business_id", businessId)
+    .order("sort_order", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  const { error } = await supabase.from("intake_fields").insert({
+    ...parsed.field,
+    business_id: businessId,
+    sort_order: Number(lastField?.sort_order ?? 0) + 10,
+  });
+
+  if (error) {
+    redirect(`/dashboard?view=Settings&message=${message(error.message)}`);
+  }
+
+  revalidatePath("/dashboard");
+  redirect(`/dashboard?view=Settings&message=${message("Intake field added.")}`);
+}
+
+export async function updateIntakeField(formData: FormData) {
+  const businessId = clean(formData.get("businessId"));
+  const fieldId = clean(formData.get("fieldId"));
+
+  if (!businessId || !fieldId) {
+    redirect(`/dashboard?view=Settings&message=${message("Could not find that intake field.")}`);
+  }
+
+  const parsed = parseIntakeField(formData);
+
+  if ("error" in parsed) {
+    redirect(`/dashboard?view=Settings&message=${message(parsed.error)}`);
+  }
+
+  const { supabase } = await requireBusinessAccess(businessId);
+  const { error } = await supabase
+    .from("intake_fields")
+    .update(parsed.field)
+    .eq("business_id", businessId)
+    .eq("id", fieldId);
+
+  if (error) {
+    redirect(`/dashboard?view=Settings&message=${message(error.message)}`);
+  }
+
+  revalidatePath("/dashboard");
+  redirect(`/dashboard?view=Settings&message=${message("Intake field saved.")}`);
+}
+
+export async function archiveIntakeField(formData: FormData) {
+  const businessId = clean(formData.get("businessId"));
+  const fieldId = clean(formData.get("fieldId"));
+
+  if (!businessId || !fieldId) {
+    redirect(`/dashboard?view=Settings&message=${message("Could not find that intake field.")}`);
+  }
+
+  const { supabase } = await requireBusinessAccess(businessId);
+  const { error } = await supabase
+    .from("intake_fields")
+    .update({ enabled: false })
+    .eq("business_id", businessId)
+    .eq("id", fieldId);
+
+  if (error) {
+    redirect(`/dashboard?view=Settings&message=${message(error.message)}`);
+  }
+
+  revalidatePath("/dashboard");
+  redirect(`/dashboard?view=Settings&message=${message("Intake field disabled.")}`);
+}
+
+export async function moveIntakeField(formData: FormData) {
+  const businessId = clean(formData.get("businessId"));
+  const fieldId = clean(formData.get("fieldId"));
+  const direction = clean(formData.get("direction"));
+
+  if (!businessId || !fieldId || (direction !== "up" && direction !== "down")) {
+    redirect(`/dashboard?view=Settings&message=${message("Could not reorder that intake field.")}`);
+  }
+
+  const { supabase } = await requireBusinessAccess(businessId);
+  const { data: fields, error: fieldsError } = await supabase
+    .from("intake_fields")
+    .select("id, sort_order")
+    .eq("business_id", businessId)
+    .order("sort_order", { ascending: true })
+    .order("created_at", { ascending: true });
+
+  if (fieldsError || !fields?.length) {
+    redirect(`/dashboard?view=Settings&message=${message(fieldsError?.message ?? "Could not load intake fields.")}`);
+  }
+
+  const currentIndex = fields.findIndex((field) => field.id === fieldId);
+  const targetIndex = direction === "up" ? currentIndex - 1 : currentIndex + 1;
+
+  if (currentIndex < 0 || targetIndex < 0 || targetIndex >= fields.length) {
+    redirect(`/dashboard?view=Settings`);
+  }
+
+  const current = fields[currentIndex];
+  const target = fields[targetIndex];
+  const { error: firstError } = await supabase
+    .from("intake_fields")
+    .update({ sort_order: target.sort_order })
+    .eq("business_id", businessId)
+    .eq("id", current.id);
+
+  if (firstError) {
+    redirect(`/dashboard?view=Settings&message=${message(firstError.message)}`);
+  }
+
+  const { error: secondError } = await supabase
+    .from("intake_fields")
+    .update({ sort_order: current.sort_order })
+    .eq("business_id", businessId)
+    .eq("id", target.id);
+
+  if (secondError) {
+    redirect(`/dashboard?view=Settings&message=${message(secondError.message)}`);
+  }
+
+  revalidatePath("/dashboard");
+  redirect(`/dashboard?view=Settings`);
+}
