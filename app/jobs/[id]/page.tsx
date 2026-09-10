@@ -7,13 +7,28 @@ import {
   markQuoteAccepted,
   markQuoteDeclined,
   markQuoteSent,
-  resolveQuoteMessage,
   saveQuote,
+  sendQuoteReply,
   setJobFollowUp,
   updateJob,
   updateJobStatus,
 } from "@/app/dashboard/actions";
-import type { Customer, CustomerSummary, IntakeResponse, Job, JobActivity, JobFile, JobSource, JobStatus, Quote, QuoteMessage, QuoteStatus } from "@/lib/job-tracker/types";
+import { enabledPipelineStatuses, normalizeServiceTypes, pipelineLabelMap } from "@/lib/job-tracker/config";
+import type {
+  BusinessPipelineStatus,
+  BusinessServiceType,
+  Customer,
+  CustomerSummary,
+  IntakeResponse,
+  Job,
+  JobActivity,
+  JobFile,
+  JobSource,
+  JobStatus,
+  Quote,
+  QuoteMessage,
+  QuoteStatus,
+} from "@/lib/job-tracker/types";
 import { createClient } from "@/lib/supabase/server";
 import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
@@ -26,7 +41,7 @@ type JobRow = Omit<Job, "customer"> & {
 
 type ActivityRow = JobActivity;
 
-const statusLabels: Record<JobStatus, string> = {
+const defaultStatusLabels: Record<JobStatus, string> = {
   lead: "Lead",
   contacted: "Contacted",
   quoted: "Quoted",
@@ -49,8 +64,6 @@ const sourceLabels: Record<JobSource, string> = {
   website_form: "Website form",
 };
 
-const statusOrder: JobStatus[] = ["lead", "contacted", "quoted", "scheduled", "in_progress", "completed", "lost"];
-const statusChangeOrder: JobStatus[] = ["lead", "contacted", "quoted", "scheduled", "in_progress", "completed"];
 const lostReasonLabels: Record<string, string> = {
   price: "Price",
   no_response: "No response",
@@ -207,6 +220,23 @@ export default async function JobDetail({
     lifetime_value_cents: 0,
   })) satisfies CustomerSummary[];
 
+  const { data: serviceTypeRows } = await supabase
+    .from("business_service_types")
+    .select("id, business_id, key, label, enabled, sort_order, created_at, updated_at")
+    .eq("business_id", job.business_id)
+    .order("sort_order", { ascending: true })
+    .order("created_at", { ascending: true });
+  const { data: pipelineStatusRows } = await supabase
+    .from("business_pipeline_statuses")
+    .select("id, business_id, key, label, semantic_type, enabled, sort_order, created_at, updated_at")
+    .eq("business_id", job.business_id)
+    .order("sort_order", { ascending: true })
+    .order("created_at", { ascending: true });
+  const serviceTypes = normalizeServiceTypes((serviceTypeRows ?? []) as BusinessServiceType[]);
+  const pipelineConfig = (pipelineStatusRows ?? []) as BusinessPipelineStatus[];
+  const pipelineStatuses = enabledPipelineStatuses(pipelineConfig);
+  const statusLabels = pipelineConfig.length ? pipelineLabelMap(pipelineConfig) : defaultStatusLabels;
+
   const { data: quoteRows } = await supabase
     .from("quotes")
     .select("id, business_id, job_id, amount_cents, notes, status, public_token, public_token_created_at, public_access_revoked_at, sent_at, accepted_at, declined_at, valid_until, created_at, updated_at")
@@ -223,7 +253,7 @@ export default async function JobDetail({
         .select("id, business_id, quote_id, job_id, message, source, resolved_at, created_at")
         .eq("quote_id", quote.id)
         .eq("business_id", job.business_id)
-        .order("created_at", { ascending: false })
+        .order("created_at", { ascending: true })
     : { data: [] };
   const quoteMessages = (quoteMessageRows ?? []) as QuoteMessage[];
 
@@ -373,7 +403,7 @@ export default async function JobDetail({
           </summary>
           <form className="settings-form" action={updateJob}>
             <input type="hidden" name="jobId" value={job.id} />
-            <JobFields customers={customers} end={end} job={job} start={start} />
+          <JobFields customers={customers} end={end} job={job} pipelineStatuses={pipelineStatuses} serviceTypes={serviceTypes} start={start} statusLabels={statusLabels} />
             <button className="button" type="submit">
               Save job
             </button>
@@ -533,7 +563,7 @@ function QuotePanel({ job, quote, quoteMessages }: { job: Job; quote: Quote | nu
   const canAccept = quote && quote.status !== "accepted" && quote.status !== "declined";
   const canDecline = quote && quote.status !== "accepted" && quote.status !== "declined";
   const publicHref = quote?.public_token ? `/quote/${quote.public_token}` : null;
-  const unresolvedMessages = quoteMessages.filter((message) => !message.resolved_at);
+  const unresolvedMessages = quoteMessages.filter((message) => message.source === "customer" && !message.resolved_at);
 
   return (
     <section className="data-panel quote-panel" id="quote">
@@ -631,32 +661,38 @@ function QuotePanel({ job, quote, quoteMessages }: { job: Job; quote: Quote | nu
           </div>
           <QuoteShareLink href={publicHref} />
           {unresolvedMessages.length ? (
-            <p className="quote-message-alert">{unresolvedMessages.length === 1 ? "1 customer question needs an answer." : `${unresolvedMessages.length} customer questions need an answer.`}</p>
+            <p className="quote-message-alert">{unresolvedMessages.length === 1 ? "1 customer message needs a reply." : `${unresolvedMessages.length} customer messages need a reply.`}</p>
           ) : null}
         </div>
       ) : null}
 
       {quoteMessages.length ? (
-        <div className="quote-messages">
-          <h3>Customer quote messages</h3>
+        <div className="quote-messages quote-thread">
+          <h3>Quote conversation</h3>
           {quoteMessages.map((quoteMessage) => (
-            <article className={quoteMessage.resolved_at ? "quote-message resolved" : "quote-message"} key={quoteMessage.id}>
+            <article className={`quote-message quote-message-${quoteMessage.source}${quoteMessage.resolved_at ? " resolved" : ""}`} key={quoteMessage.id}>
               <div>
-                <span>{dateTimeLabel(quoteMessage.created_at)}</span>
+                <span>{quoteMessage.source === "business" ? "Business" : "Customer"} · {dateTimeLabel(quoteMessage.created_at)}</span>
                 <p>{quoteMessage.message}</p>
-                {quoteMessage.resolved_at ? <em>Answered {dateLabel(quoteMessage.resolved_at)}</em> : <em>Waiting for an answer</em>}
+                {quoteMessage.source === "customer" && quoteMessage.resolved_at ? <em>Answered {dateLabel(quoteMessage.resolved_at)}</em> : null}
+                {quoteMessage.source === "customer" && !quoteMessage.resolved_at ? <em>Waiting for a reply</em> : null}
               </div>
-              {!quoteMessage.resolved_at ? (
-                <form action={resolveQuoteMessage}>
-                  <input type="hidden" name="messageId" value={quoteMessage.id} />
-                  <button className="button button-secondary" type="submit">
-                    Mark Answered
-                  </button>
-                </form>
-              ) : null}
             </article>
           ))}
         </div>
+      ) : null}
+
+      {quote ? (
+        <form action={sendQuoteReply} className="quote-reply-form">
+          <input type="hidden" name="quoteId" value={quote.id} />
+          <label>
+            Reply to customer
+            <textarea name="reply" maxLength={1000} placeholder="Write a short reply about this quote." rows={3} required />
+          </label>
+          <button className="button button-secondary" type="submit">
+            Send Reply
+          </button>
+        </form>
       ) : null}
     </section>
   );

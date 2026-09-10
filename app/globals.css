@@ -2160,13 +2160,16 @@ p {
 
 .quote-message {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: start;
   gap: 12px;
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
   padding: 11px;
   background: #fff;
+}
+
+.quote-message-business {
+  border-color: rgba(35, 115, 111, 0.18);
+  background: var(--accent-soft);
 }
 
 .quote-message.resolved {
@@ -2186,6 +2189,33 @@ p {
   margin: 5px 0;
   color: var(--foreground);
   line-height: 1.55;
+}
+
+.quote-reply-form {
+  display: grid;
+  gap: 10px;
+  border-top: 1px solid var(--line);
+  padding: 12px 13px 13px;
+}
+
+.quote-reply-form label {
+  display: grid;
+  gap: 7px;
+  color: var(--foreground);
+  font-size: 0.84rem;
+  font-weight: 850;
+}
+
+.quote-reply-form textarea {
+  width: 100%;
+  min-height: 92px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  padding: 9px 10px;
+  background: #fff;
+  color: var(--foreground);
+  font: inherit;
+  resize: vertical;
 }
 
 .quote-status {
@@ -2553,6 +2583,44 @@ p {
   color: var(--foreground);
   font: inherit;
   resize: vertical;
+}
+
+.public-quote-thread {
+  display: grid;
+  gap: 10px;
+  border-top: 1px solid var(--line);
+  padding-top: 16px;
+}
+
+.public-quote-thread h2 {
+  margin: 0;
+  color: var(--foreground);
+  font-size: 1rem;
+}
+
+.public-quote-message {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 12px;
+  background: #fff;
+}
+
+.public-quote-message-business {
+  border-color: rgba(35, 115, 111, 0.18);
+  background: var(--accent-soft);
+}
+
+.public-quote-message span {
+  display: block;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 900;
+}
+
+.public-quote-message p {
+  margin: 5px 0 0;
+  color: var(--foreground);
+  line-height: 1.6;
 }
 
 .public-intake-form {

@@ -8,16 +8,16 @@ type IntakeFormProps = {
   businessSlug: string;
   customFields: IntakeField[];
   description: string;
+  serviceTypes: string[];
   title: string;
 };
 
-const serviceTypes = ["Garage floor", "Patio", "Commercial floor", "Basement", "Other"];
 const budgetRanges = ["Not sure yet", "Under $2,500", "$2,500 - $5,000", "$5,000 - $10,000", "$10,000+"];
 const maxPhotoCount = 5;
 const maxPhotoSize = 10 * 1024 * 1024;
 const allowedPhotoTypes = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
 
-export function IntakeForm({ businessName, businessSlug, customFields, description, title }: IntakeFormProps) {
+export function IntakeForm({ businessName, businessSlug, customFields, description, serviceTypes, title }: IntakeFormProps) {
   const [error, setError] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [success, setSuccess] = useState("");

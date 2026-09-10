@@ -3,20 +3,49 @@
 import { logout } from "@/app/auth/actions";
 import {
   archiveIntakeField,
+  archiveServiceType,
   createCustomer,
   createIntakeField,
   createJob,
+  createServiceType,
   markJobContacted,
+  moveConfigItem,
   moveIntakeField,
   resolveQuoteMessage,
   updateBusiness,
   updateCustomer,
+  updateDashboardWidgetConfig,
   updateIntakeField,
   updateIntakeSettings,
   updateJob,
   updateJobStatus,
+  updatePipelineStatusConfig,
+  updateServiceType,
 } from "@/app/dashboard/actions";
-import type { Business, Customer, CustomerSummary, IntakeField, IntakeFieldType, Job, JobActivity, JobSource, JobStatus, QuoteMessage } from "@/lib/job-tracker/types";
+import {
+  dashboardWidgetRegistry,
+  enabledPipelineStatuses,
+  normalizeDashboardWidgets,
+  normalizePipelineStatuses,
+  normalizeServiceTypes,
+  pipelineLabelMap,
+} from "@/lib/job-tracker/config";
+import type {
+  Business,
+  BusinessDashboardWidget,
+  BusinessPipelineStatus,
+  BusinessServiceType,
+  Customer,
+  CustomerSummary,
+  DashboardWidgetKey,
+  IntakeField,
+  IntakeFieldType,
+  Job,
+  JobActivity,
+  JobSource,
+  JobStatus,
+  QuoteMessage,
+} from "@/lib/job-tracker/types";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import type { KeyboardEvent, MouseEvent } from "react";
@@ -41,11 +70,14 @@ type DashboardClientProps = {
   activities: JobActivity[];
   business: Business;
   customers: CustomerSummary[];
+  dashboardWidgets: BusinessDashboardWidget[];
   intakeFields: IntakeField[];
   initialView?: View;
   jobs: Job[];
   message?: string;
+  pipelineStatuses: BusinessPipelineStatus[];
   quoteMessages: (QuoteMessage & { job: Job | null })[];
+  serviceTypes: BusinessServiceType[];
   userEmail: string;
 };
 
@@ -83,7 +115,6 @@ const intakeFieldTypeLabels: Record<IntakeFieldType, string> = {
 
 const statusOrder: JobStatus[] = ["lead", "contacted", "quoted", "scheduled", "in_progress", "completed", "lost"];
 const statusChangeOrder: JobStatus[] = ["lead", "contacted", "quoted", "scheduled", "in_progress", "completed"];
-const pipelineStatuses: JobStatus[] = ["lead", "contacted", "quoted", "scheduled", "in_progress", "completed", "lost"];
 const sourceOrder: JobSource[] = ["website_form", "google", "facebook", "instagram", "referral", "repeat_customer", "phone", "walk_in", "manual", "other"];
 const navItems: View[] = ["Overview", "Pipeline", "Jobs", "Customers", "Calendar", "Analytics", "Settings"];
 const operationalStatuses: JobStatus[] = ["scheduled", "in_progress"];
@@ -200,7 +231,14 @@ function buildAttentionItems(jobs: Job[], quoteMessages: (QuoteMessage & { job: 
   const soonMs = 7 * 86_400_000;
   const items: AttentionItem[] = [];
 
+  const unresolvedByQuote = new Map<string, QuoteMessage & { job: Job | null }>();
   quoteMessages.forEach((quoteMessage) => {
+    if (quoteMessage.source === "customer" && !quoteMessage.resolved_at && !unresolvedByQuote.has(quoteMessage.quote_id)) {
+      unresolvedByQuote.set(quoteMessage.quote_id, quoteMessage);
+    }
+  });
+
+  unresolvedByQuote.forEach((quoteMessage) => {
     if (!quoteMessage.job || quoteMessage.resolved_at) {
       return;
     }
@@ -414,11 +452,14 @@ export function DashboardClient({
   activities,
   business,
   customers,
+  dashboardWidgets,
   intakeFields,
   initialView,
   jobs,
   message,
+  pipelineStatuses,
   quoteMessages,
+  serviceTypes,
   userEmail,
 }: DashboardClientProps) {
   const [activeView, setActiveView] = useState<View>(initialView ?? "Overview");
@@ -508,6 +549,11 @@ export function DashboardClient({
     .sort((a, b) => String(a.scheduled_start).localeCompare(String(b.scheduled_start)))
     .slice(0, 5);
   const needsAttention = useMemo(() => buildAttentionItems(jobs, quoteMessages), [jobs, quoteMessages]);
+  const configuredServices = useMemo(() => normalizeServiceTypes(serviceTypes), [serviceTypes]);
+  const configuredPipelineStatuses = useMemo(() => normalizePipelineStatuses(pipelineStatuses), [pipelineStatuses]);
+  const enabledStatuses = useMemo(() => enabledPipelineStatuses(pipelineStatuses), [pipelineStatuses]);
+  const configuredStatusLabels = useMemo(() => pipelineLabelMap(pipelineStatuses), [pipelineStatuses]);
+  const configuredDashboardWidgets = useMemo(() => normalizeDashboardWidgets(dashboardWidgets), [dashboardWidgets]);
 
   const showSearch = activeView === "Overview" || activeView === "Pipeline" || activeView === "Jobs" || activeView === "Customers";
 
@@ -611,10 +657,12 @@ export function DashboardClient({
               activities={activities}
               completedRevenue={completedRevenue}
               counts={counts}
+              dashboardWidgets={configuredDashboardWidgets}
               jobs={filteredJobs}
               needsAttention={needsAttention}
               onCreateJob={() => setJobModal({})}
               onViewJobs={() => setActiveView("Jobs")}
+              pipelineStatuses={configuredPipelineStatuses}
               totalPipeline={totalPipeline}
               upcomingJobs={upcomingJobs}
               averageJobValue={averageJobValue}
@@ -625,6 +673,7 @@ export function DashboardClient({
             <JobsView
               filteredJobs={filteredJobs}
               jobs={jobs}
+              pipelineStatuses={configuredPipelineStatuses}
               setSort={setSort}
               setStatusFilter={setStatusFilter}
               sort={sort}
@@ -632,7 +681,9 @@ export function DashboardClient({
             />
           ) : null}
 
-          {activeView === "Pipeline" ? <PipelineView jobs={filteredJobs} totalJobs={jobs.length} /> : null}
+          {activeView === "Pipeline" ? (
+            <PipelineView jobs={filteredJobs} pipelineStatuses={enabledStatuses} statusLabels={configuredStatusLabels} totalJobs={jobs.length} />
+          ) : null}
 
           {activeView === "Customers" ? (
             <CustomersView customers={visibleCustomers} hasCustomers={customers.length > 0} onCreate={() => setCustomerModal("new")} />
@@ -656,11 +707,21 @@ export function DashboardClient({
               completedRevenue={completedRevenue}
               counts={counts}
               jobs={jobs}
+              statusLabels={configuredStatusLabels}
+              statusOrder={configuredPipelineStatuses.map((status) => status.semantic_type)}
               totalPipeline={totalPipeline}
             />
           ) : null}
 
-          {activeView === "Settings" ? <SettingsView business={business} intakeFields={intakeFields} /> : null}
+          {activeView === "Settings" ? (
+            <SettingsView
+              business={business}
+              dashboardWidgets={configuredDashboardWidgets}
+              intakeFields={intakeFields}
+              pipelineStatuses={configuredPipelineStatuses}
+              serviceTypes={serviceTypes.length ? serviceTypes : configuredServices}
+            />
+          ) : null}
         </section>
       </div>
 
@@ -671,6 +732,9 @@ export function DashboardClient({
           job={jobModal.job ?? null}
           onClose={() => setJobModal(null)}
           scheduledStart={jobModal.scheduledStart}
+          serviceTypes={configuredServices}
+          pipelineStatuses={enabledStatuses}
+          statusLabels={configuredStatusLabels}
         />
       ) : null}
 
@@ -690,10 +754,12 @@ function OverviewView({
   averageJobValue,
   completedRevenue,
   counts,
+  dashboardWidgets,
   jobs,
   needsAttention,
   onCreateJob,
   onViewJobs,
+  pipelineStatuses,
   totalPipeline,
   upcomingJobs,
 }: {
@@ -701,25 +767,30 @@ function OverviewView({
   averageJobValue: number;
   completedRevenue: number;
   counts: Record<JobStatus, number>;
+  dashboardWidgets: ReturnType<typeof normalizeDashboardWidgets>;
   jobs: Job[];
   needsAttention: AttentionItem[];
   onCreateJob: () => void;
   onViewJobs: () => void;
+  pipelineStatuses: BusinessPipelineStatus[];
   totalPipeline: number;
   upcomingJobs: Job[];
 }) {
+  const widgetEnabled = (key: DashboardWidgetKey) => dashboardWidgets.some((widget) => widget.widget_key === key && widget.enabled);
+
   return (
     <>
       <KpiGrid
         averageJobValue={averageJobValue}
         completedRevenue={completedRevenue}
         counts={counts}
+        dashboardWidgets={dashboardWidgets}
         totalPipeline={totalPipeline}
       />
-      <NeedsAttentionPanel items={needsAttention} onViewJobs={onViewJobs} />
+      {widgetEnabled("needs_attention") ? <NeedsAttentionPanel items={needsAttention} onViewJobs={onViewJobs} /> : null}
       <section className="content-grid">
-        <JobsPanel jobs={jobs.slice(0, 6)} title="Active job board" />
-        <SideSummary activities={activities} onCreateJob={onCreateJob} upcomingJobs={upcomingJobs} />
+        {widgetEnabled("active_job_board") ? <JobsPanel jobs={jobs.slice(0, 6)} pipelineStatuses={pipelineStatuses} title="Active job board" /> : null}
+        {widgetEnabled("upcoming") ? <SideSummary activities={activities} onCreateJob={onCreateJob} upcomingJobs={upcomingJobs} /> : null}
       </section>
     </>
   );
@@ -825,6 +896,7 @@ function NeedsAttentionPanel({ items, onViewJobs }: { items: AttentionItem[]; on
 function JobsView({
   filteredJobs,
   jobs,
+  pipelineStatuses,
   setSort,
   setStatusFilter,
   sort,
@@ -832,6 +904,7 @@ function JobsView({
 }: {
   filteredJobs: Job[];
   jobs: Job[];
+  pipelineStatuses: BusinessPipelineStatus[];
   setSort: (value: string) => void;
   setStatusFilter: (value: "all" | JobStatus) => void;
   sort: string;
@@ -841,6 +914,7 @@ function JobsView({
     <JobsPanel
       fullWidth
       jobs={filteredJobs}
+      pipelineStatuses={pipelineStatuses}
       setSort={setSort}
       setStatusFilter={setStatusFilter}
       sort={sort}
@@ -851,10 +925,20 @@ function JobsView({
   );
 }
 
-function PipelineView({ jobs, totalJobs }: { jobs: Job[]; totalJobs: number }) {
-  const groupedJobs = pipelineStatuses.map((status) => ({
-    jobs: jobs.filter((job) => job.status === status),
-    status,
+function PipelineView({
+  jobs,
+  pipelineStatuses,
+  statusLabels,
+  totalJobs,
+}: {
+  jobs: Job[];
+  pipelineStatuses: BusinessPipelineStatus[];
+  statusLabels: Record<JobStatus, string>;
+  totalJobs: number;
+}) {
+  const groupedJobs = pipelineStatuses.map((statusConfig) => ({
+    jobs: jobs.filter((job) => job.status === statusConfig.semantic_type),
+    status: statusConfig.semantic_type,
   }));
 
   return (
@@ -877,7 +961,7 @@ function PipelineView({ jobs, totalJobs }: { jobs: Job[]; totalJobs: number }) {
               </div>
               <div className="pipeline-cards">
                 {columnJobs.length ? (
-                  columnJobs.map((job) => <PipelineCard job={job} key={job.id} />)
+                  columnJobs.map((job) => <PipelineCard job={job} key={job.id} pipelineStatuses={pipelineStatuses} statusLabels={statusLabels} />)
                 ) : (
                   <p className="pipeline-empty">No {statusLabels[status].toLowerCase()} jobs.</p>
                 )}
@@ -895,7 +979,15 @@ function PipelineView({ jobs, totalJobs }: { jobs: Job[]; totalJobs: number }) {
   );
 }
 
-function PipelineCard({ job }: { job: Job }) {
+function PipelineCard({
+  job,
+  pipelineStatuses,
+  statusLabels,
+}: {
+  job: Job;
+  pipelineStatuses: BusinessPipelineStatus[];
+  statusLabels: Record<JobStatus, string>;
+}) {
   const scheduledText = job.scheduled_start ? `${dateLabel(job.scheduled_start)} at ${timeLabel(job.scheduled_start)}` : null;
 
   return (
@@ -927,9 +1019,9 @@ function PipelineCard({ job }: { job: Job }) {
             name="status"
             onChange={(event) => event.currentTarget.form?.requestSubmit()}
           >
-            {statusChangeOrder.map((status) => (
-              <option key={status} value={status}>
-                {statusLabels[status]}
+            {pipelineStatuses.filter((status) => status.semantic_type !== "lost").map((status) => (
+              <option key={status.semantic_type} value={status.semantic_type}>
+                {statusLabels[status.semantic_type]}
               </option>
             ))}
           </select>
@@ -942,6 +1034,7 @@ function PipelineCard({ job }: { job: Job }) {
 function JobsPanel({
   fullWidth = false,
   jobs,
+  pipelineStatuses = normalizePipelineStatuses(),
   setSort,
   setStatusFilter,
   sort,
@@ -951,6 +1044,7 @@ function JobsPanel({
 }: {
   fullWidth?: boolean;
   jobs: Job[];
+  pipelineStatuses?: BusinessPipelineStatus[];
   setSort?: (value: string) => void;
   setStatusFilter?: (value: "all" | JobStatus) => void;
   sort?: string;
@@ -959,6 +1053,7 @@ function JobsPanel({
   totalJobs?: number;
 }) {
   const router = useRouter();
+  const statusLabelMap = Object.fromEntries(pipelineStatuses.map((status) => [status.semantic_type, status.label])) as Record<JobStatus, string>;
 
   return (
     <div className={fullWidth ? "data-panel jobs-panel full-width" : "data-panel jobs-panel"}>
@@ -975,9 +1070,9 @@ function JobsPanel({
               value={statusFilter}
             >
               <option value="all">All statuses</option>
-              {statusOrder.map((value) => (
-                <option key={value} value={value}>
-                  {statusLabels[value]}
+              {pipelineStatuses.map((status) => (
+                <option key={status.semantic_type} value={status.semantic_type}>
+                  {status.label}
                 </option>
               ))}
             </select>
@@ -1029,7 +1124,7 @@ function JobsPanel({
                   </td>
                   <td>
                     {job.status === "lost" ? (
-                      <span className={`status-pill status-${job.status}`}>{statusLabels[job.status]}</span>
+                      <span className={`status-pill status-${job.status}`}>{statusLabelMap[job.status]}</span>
                     ) : (
                       <form action={updateJobStatus}>
                         <input type="hidden" name="jobId" value={job.id} />
@@ -1041,9 +1136,9 @@ function JobsPanel({
                           defaultValue={job.status}
                           onChange={(event) => event.currentTarget.form?.requestSubmit()}
                         >
-                          {statusChangeOrder.map((value) => (
-                            <option key={value} value={value}>
-                              {statusLabels[value]}
+                          {pipelineStatuses.filter((status) => status.enabled && status.semantic_type !== "lost").map((status) => (
+                            <option key={status.semantic_type} value={status.semantic_type}>
+                              {status.label}
                             </option>
                           ))}
                         </select>
@@ -1082,26 +1177,72 @@ function KpiGrid({
   averageJobValue,
   completedRevenue,
   counts,
+  dashboardWidgets,
   totalPipeline,
 }: {
   averageJobValue: number;
   completedRevenue: number;
   counts: Record<JobStatus, number>;
+  dashboardWidgets?: ReturnType<typeof normalizeDashboardWidgets>;
   totalPipeline: number;
 }) {
+  const widgets = (dashboardWidgets ?? normalizeDashboardWidgets()).filter((widget) => widget.enabled && widget.zone !== "section");
+  const values: Record<DashboardWidgetKey, string | number> = {
+    active_job_board: "",
+    avg_job: money(averageJobValue),
+    completed: counts.completed,
+    in_progress: counts.in_progress,
+    needs_attention: "",
+    new_leads: counts.lead,
+    open_pipeline: money(totalPipeline),
+    quoted: counts.quoted,
+    scheduled: counts.scheduled,
+    upcoming: "",
+  };
+  const icons: Record<DashboardWidgetKey, React.ReactNode> = {
+    active_job_board: <ProgressIcon />,
+    avg_job: <DollarIcon />,
+    completed: <CheckIcon />,
+    in_progress: <ProgressIcon />,
+    needs_attention: <LeadIcon />,
+    new_leads: <LeadIcon />,
+    open_pipeline: <DollarIcon />,
+    quoted: <QuoteIcon />,
+    scheduled: <CalendarIcon />,
+    upcoming: <CalendarIcon />,
+  };
+  const primary = widgets.filter((widget) => widget.zone === "primary");
+  const secondary = widgets.filter((widget) => widget.zone === "secondary");
+
   return (
     <section className="kpi-stack" aria-label="Job metrics">
-      <div className="kpi-grid kpi-grid-primary">
-        <KpiCard label="New Leads" value={counts.lead} helper="Needs first response" icon={<LeadIcon />} priority="primary" />
-        <KpiCard label="Scheduled" value={counts.scheduled} helper="Confirmed work" icon={<CalendarIcon />} priority="primary" />
-        <KpiCard label="In Progress" value={counts.in_progress} helper="Active installs" icon={<ProgressIcon />} priority="primary" />
-        <KpiCard label="Open Pipeline" value={money(totalPipeline)} helper="Not completed" icon={<DollarIcon />} priority="primary" />
-      </div>
-      <div className="kpi-secondary-row">
-        <KpiCard label="Quoted" value={counts.quoted} helper="Awaiting answer" icon={<QuoteIcon />} />
-        <KpiCard label="Completed" value={counts.completed} helper={money(completedRevenue)} icon={<CheckIcon />} />
-        <KpiCard label="Avg. Job" value={money(averageJobValue)} helper="Across all jobs" icon={<DollarIcon />} />
-      </div>
+      {primary.length ? (
+        <div className="kpi-grid kpi-grid-primary">
+          {primary.map((widget) => (
+            <KpiCard
+              helper={widget.widget_key === "completed" ? money(completedRevenue) : widget.helper}
+              icon={icons[widget.widget_key]}
+              key={widget.widget_key}
+              label={widget.label}
+              priority="primary"
+              value={values[widget.widget_key]}
+            />
+          ))}
+        </div>
+      ) : null}
+      {secondary.length ? (
+        <div className="kpi-secondary-row">
+          {secondary.map((widget) => (
+            <KpiCard
+              helper={widget.widget_key === "completed" ? money(completedRevenue) : widget.helper}
+              icon={icons[widget.widget_key]}
+              key={widget.widget_key}
+              label={widget.label}
+              value={values[widget.widget_key]}
+            />
+          ))}
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -1423,12 +1564,16 @@ function AnalyticsView({
   completedRevenue,
   counts,
   jobs,
+  statusLabels,
+  statusOrder,
   totalPipeline,
 }: {
   averageJobValue: number;
   completedRevenue: number;
   counts: Record<JobStatus, number>;
   jobs: Job[];
+  statusLabels: Record<JobStatus, string>;
+  statusOrder: JobStatus[];
   totalPipeline: number;
 }) {
   const maxCount = Math.max(...Object.values(counts), 1);
@@ -1527,9 +1672,23 @@ function buildSourcePerformance(jobs: Job[]) {
     .filter((row) => row.leads > 0);
 }
 
-function SettingsView({ business, intakeFields }: { business: Business; intakeFields: IntakeField[] }) {
+function SettingsView({
+  business,
+  dashboardWidgets,
+  intakeFields,
+  pipelineStatuses,
+  serviceTypes,
+}: {
+  business: Business;
+  dashboardWidgets: ReturnType<typeof normalizeDashboardWidgets>;
+  intakeFields: IntakeField[];
+  pipelineStatuses: BusinessPipelineStatus[];
+  serviceTypes: BusinessServiceType[];
+}) {
   const intakePath = business.slug ? `/intake/${business.slug}` : "";
   const enabledFieldCount = intakeFields.filter((field) => field.enabled).length;
+  const enabledServiceCount = serviceTypes.filter((service) => service.enabled).length;
+  const enabledDashboardCount = dashboardWidgets.filter((widget) => widget.enabled).length;
 
   async function copyIntakeLink() {
     if (!intakePath) {
@@ -1554,6 +1713,157 @@ function SettingsView({ business, intakeFields }: { business: Business; intakeFi
           </div>
           <SubmitButton>Save settings</SubmitButton>
         </form>
+      </section>
+
+      <section className="data-panel settings-panel">
+        <div className="panel-heading">
+          <div>
+            <h2>Services</h2>
+            <p className="muted">Control the service choices used when creating jobs and collecting public requests.</p>
+          </div>
+          <span className="panel-count">{pluralize(enabledServiceCount, "active service")}</span>
+        </div>
+        <div className="intake-fields-list">
+          {serviceTypes.map((service, index) => (
+            <details className={service.enabled ? "intake-field-row" : "intake-field-row disabled-field"} key={service.key}>
+              <summary>
+                <span>
+                  <strong>{service.label}</strong>
+                  <em>{service.key}</em>
+                </span>
+                <span className={service.enabled ? "status-pill status-scheduled" : "status-pill"}>{service.enabled ? "Enabled" : "Disabled"}</span>
+              </summary>
+              {service.id ? (
+                <>
+                  <form className="settings-form intake-field-form" action={updateServiceType}>
+                    <input type="hidden" name="businessId" value={business.id} />
+                    <input type="hidden" name="serviceId" value={service.id} />
+                    <div className="field">
+                      <label htmlFor={`service-label-${service.key}`}>Display label</label>
+                      <input id={`service-label-${service.key}`} name="label" defaultValue={service.label} maxLength={80} required />
+                    </div>
+                    <label className="toggle-row">
+                      <input name="enabled" type="checkbox" defaultChecked={service.enabled} />
+                      <span>Enabled</span>
+                    </label>
+                    <SubmitButton>Save service</SubmitButton>
+                  </form>
+                  <ConfigMoveButtons businessId={business.id} configType="services" disabledDown={index === serviceTypes.length - 1} disabledUp={index === 0} itemId={service.id} />
+                </>
+              ) : (
+                <p className="message">Run the workspace config migration to edit service settings.</p>
+              )}
+            </details>
+          ))}
+        </div>
+        <details className="intake-field-builder">
+          <summary>Add service type</summary>
+          <form className="settings-form intake-field-form" action={createServiceType}>
+            <input type="hidden" name="businessId" value={business.id} />
+            <div className="split-fields">
+              <div className="field">
+                <label htmlFor="new-service-label">Display label</label>
+                <input id="new-service-label" name="label" placeholder="Window Cleaning" required />
+              </div>
+              <div className="field">
+                <label htmlFor="new-service-key">Stable key</label>
+                <input id="new-service-key" name="key" pattern="[a-z][a-z0-9_]{1,40}" placeholder="window_cleaning" />
+                <p className="field-hint">Leave blank to generate from the label.</p>
+              </div>
+            </div>
+            <SubmitButton>Add service</SubmitButton>
+          </form>
+        </details>
+      </section>
+
+      <section className="data-panel settings-panel">
+        <div className="panel-heading compact">
+          <h2>Pipeline</h2>
+          <p className="muted">Rename or reorder visible stages while preserving the internal workflow meaning.</p>
+        </div>
+        <div className="intake-fields-list">
+          {pipelineStatuses.map((status, index) => (
+            <details className={status.enabled ? "intake-field-row" : "intake-field-row disabled-field"} key={status.semantic_type}>
+              <summary>
+                <span>
+                  <strong>{status.label}</strong>
+                  <em>Meaning: {statusLabels[status.semantic_type]}</em>
+                </span>
+                <span className={status.enabled ? "status-pill status-scheduled" : "status-pill"}>{status.enabled ? "Enabled" : "Disabled"}</span>
+              </summary>
+              {status.id ? (
+                <>
+                  <form className="settings-form intake-field-form" action={updatePipelineStatusConfig}>
+                    <input type="hidden" name="businessId" value={business.id} />
+                    <input type="hidden" name="statusId" value={status.id} />
+                    <input type="hidden" name="semanticType" value={status.semantic_type} />
+                    <div className="field">
+                      <label htmlFor={`pipeline-label-${status.semantic_type}`}>Display label</label>
+                      <input id={`pipeline-label-${status.semantic_type}`} name="label" defaultValue={status.label} maxLength={80} required />
+                    </div>
+                    <label className="toggle-row">
+                      <input
+                        disabled={status.semantic_type === "lead" || status.semantic_type === "completed" || status.semantic_type === "lost"}
+                        name="enabled"
+                        type="checkbox"
+                        defaultChecked={status.enabled}
+                      />
+                      <span>{status.semantic_type === "lead" || status.semantic_type === "completed" || status.semantic_type === "lost" ? "Required workflow stage" : "Enabled"}</span>
+                    </label>
+                    <SubmitButton>Save stage</SubmitButton>
+                  </form>
+                  <ConfigMoveButtons businessId={business.id} configType="pipeline" disabledDown={index === pipelineStatuses.length - 1} disabledUp={index === 0} itemId={status.id} />
+                </>
+              ) : (
+                <p className="message">Run the workspace config migration to edit pipeline settings.</p>
+              )}
+            </details>
+          ))}
+        </div>
+      </section>
+
+      <section className="data-panel settings-panel">
+        <div className="panel-heading">
+          <div>
+            <h2>Dashboard</h2>
+            <p className="muted">Choose which supported KPIs and sections appear on the Overview.</p>
+          </div>
+          <span className="panel-count">{pluralize(enabledDashboardCount, "visible item")}</span>
+        </div>
+        <div className="intake-fields-list">
+          {dashboardWidgets.map((widget, index) => (
+            <details className={widget.enabled ? "intake-field-row" : "intake-field-row disabled-field"} key={widget.widget_key}>
+              <summary>
+                <span>
+                  <strong>{widget.label}</strong>
+                  <em>{dashboardWidgetRegistry[widget.widget_key].defaultLabel} · {widget.zone}</em>
+                </span>
+                <span className={widget.enabled ? "status-pill status-scheduled" : "status-pill"}>{widget.enabled ? "Visible" : "Hidden"}</span>
+              </summary>
+              {widget.id ? (
+                <>
+                  <form className="settings-form intake-field-form" action={updateDashboardWidgetConfig}>
+                    <input type="hidden" name="businessId" value={business.id} />
+                    <input type="hidden" name="widgetId" value={widget.id} />
+                    <input type="hidden" name="widgetKey" value={widget.widget_key} />
+                    <div className="field">
+                      <label htmlFor={`widget-label-${widget.widget_key}`}>Optional label override</label>
+                      <input id={`widget-label-${widget.widget_key}`} name="labelOverride" defaultValue={widget.label_override ?? ""} maxLength={80} placeholder={dashboardWidgetRegistry[widget.widget_key].defaultLabel} />
+                    </div>
+                    <label className="toggle-row">
+                      <input name="enabled" type="checkbox" defaultChecked={widget.enabled} />
+                      <span>Visible on Overview</span>
+                    </label>
+                    <SubmitButton>Save dashboard item</SubmitButton>
+                  </form>
+                  <ConfigMoveButtons businessId={business.id} configType="dashboard" disabledDown={index === dashboardWidgets.length - 1} disabledUp={index === 0} itemId={widget.id} />
+                </>
+              ) : (
+                <p className="message">Run the workspace config migration to edit dashboard settings.</p>
+              )}
+            </details>
+          ))}
+        </div>
       </section>
 
       <section className="data-panel settings-panel">
@@ -1743,6 +2053,43 @@ function IntakeFieldInputs({ businessId, field }: { businessId: string; field?: 
   );
 }
 
+function ConfigMoveButtons({
+  businessId,
+  configType,
+  disabledDown,
+  disabledUp,
+  itemId,
+}: {
+  businessId: string;
+  configType: "services" | "pipeline" | "dashboard";
+  disabledDown: boolean;
+  disabledUp: boolean;
+  itemId: string;
+}) {
+  return (
+    <div className="intake-field-actions">
+      <form action={moveConfigItem}>
+        <input type="hidden" name="businessId" value={businessId} />
+        <input type="hidden" name="configType" value={configType} />
+        <input type="hidden" name="itemId" value={itemId} />
+        <input type="hidden" name="direction" value="up" />
+        <button className="button button-secondary" disabled={disabledUp} type="submit">
+          Move up
+        </button>
+      </form>
+      <form action={moveConfigItem}>
+        <input type="hidden" name="businessId" value={businessId} />
+        <input type="hidden" name="configType" value={configType} />
+        <input type="hidden" name="itemId" value={itemId} />
+        <input type="hidden" name="direction" value="down" />
+        <button className="button button-secondary" disabled={disabledDown} type="submit">
+          Move down
+        </button>
+      </form>
+    </div>
+  );
+}
+
 function CustomerModal({
   businessId,
   customer,
@@ -1785,13 +2132,19 @@ function JobModal({
   customers,
   job,
   onClose,
+  pipelineStatuses,
   scheduledStart,
+  serviceTypes,
+  statusLabels,
 }: {
   businessId: string;
   customers: CustomerSummary[];
   job: Job | null;
   onClose: () => void;
+  pipelineStatuses: BusinessPipelineStatus[];
   scheduledStart?: Date;
+  serviceTypes: BusinessServiceType[];
+  statusLabels: Record<JobStatus, string>;
 }) {
   const start = job ? dateTimeValue(job.scheduled_start) : scheduledStart ? dateTimeValue(scheduledStart.toISOString()) : { date: "", time: "" };
   const end = job ? dateTimeValue(job.scheduled_end) : { date: "", time: "" };
@@ -1811,7 +2164,7 @@ function JobModal({
         <form className="modal-form" action={job ? updateJob : createJob}>
           <input type="hidden" name="businessId" value={businessId} />
           {job ? <input type="hidden" name="jobId" value={job.id} /> : null}
-          <JobFields customers={customers} end={end} job={job} start={start} />
+          <JobFields customers={customers} end={end} job={job} pipelineStatuses={pipelineStatuses} serviceTypes={serviceTypes} start={start} statusLabels={statusLabels} />
           <div className="modal-actions">
             <button className="button button-secondary" onClick={onClose} type="button">
               Cancel
@@ -1867,13 +2220,21 @@ export function JobFields({
   customers,
   end,
   job,
+  pipelineStatuses = normalizePipelineStatuses(),
+  serviceTypes = normalizeServiceTypes(),
   start,
+  statusLabels = pipelineLabelMap(),
 }: {
   customers: CustomerSummary[];
   end: { date: string; time: string };
   job: Job | null;
+  pipelineStatuses?: BusinessPipelineStatus[];
+  serviceTypes?: BusinessServiceType[];
   start: { date: string; time: string };
+  statusLabels?: Record<JobStatus, string>;
 }) {
+  const enabledStatusOptions = job?.status === "lost" ? pipelineStatuses : pipelineStatuses.filter((status) => status.enabled && status.semantic_type !== "lost");
+
   return (
     <>
       <div className="field">
@@ -1901,9 +2262,9 @@ export function JobFields({
         <div className="field">
           <label htmlFor="status">Status</label>
           <select id="status" name="status" defaultValue={job?.status ?? "lead"}>
-            {(job?.status === "lost" ? statusOrder : statusChangeOrder).map((value) => (
-              <option key={value} value={value}>
-                {statusLabels[value]}
+            {enabledStatusOptions.map((status) => (
+              <option key={status.semantic_type} value={status.semantic_type}>
+                {statusLabels[status.semantic_type]}
               </option>
             ))}
           </select>
@@ -1912,6 +2273,20 @@ export function JobFields({
           <label htmlFor="price">Job value</label>
           <input id="price" name="price" inputMode="decimal" defaultValue={job ? inputMoney(job.price_cents) : ""} placeholder="3200" />
         </div>
+      </div>
+      <div className="field">
+        <label htmlFor="projectType">Service type</label>
+        <select id="projectType" name="projectType" defaultValue={job?.project_type ?? ""}>
+          <option value="">Not specified</option>
+          {serviceTypes.map((service) => (
+            <option key={service.key} value={service.label}>
+              {service.label}
+            </option>
+          ))}
+          {job?.project_type && !serviceTypes.some((service) => service.label === job.project_type) ? (
+            <option value={job.project_type}>{job.project_type}</option>
+          ) : null}
+        </select>
       </div>
       <div className="field">
         <label htmlFor="source">Lead source</label>

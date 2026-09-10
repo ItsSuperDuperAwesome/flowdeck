@@ -1,4 +1,15 @@
 export type JobStatus = "lead" | "contacted" | "quoted" | "scheduled" | "in_progress" | "completed" | "lost";
+export type DashboardWidgetKey =
+  | "new_leads"
+  | "quoted"
+  | "scheduled"
+  | "in_progress"
+  | "completed"
+  | "open_pipeline"
+  | "avg_job"
+  | "needs_attention"
+  | "active_job_board"
+  | "upcoming";
 
 export type JobSource =
   | "manual"
@@ -87,6 +98,40 @@ export type IntakeField = {
   updated_at: string;
 };
 
+export type BusinessServiceType = {
+  id: string;
+  business_id: string;
+  key: string;
+  label: string;
+  enabled: boolean;
+  sort_order: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type BusinessPipelineStatus = {
+  id: string;
+  business_id: string;
+  key: JobStatus;
+  label: string;
+  semantic_type: JobStatus;
+  enabled: boolean;
+  sort_order: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type BusinessDashboardWidget = {
+  id: string;
+  business_id: string;
+  widget_key: DashboardWidgetKey;
+  label_override: string | null;
+  enabled: boolean;
+  sort_order: number;
+  created_at: string;
+  updated_at: string;
+};
+
 export type IntakeResponse = {
   label: string;
   type: IntakeFieldType;
@@ -144,7 +189,7 @@ export type QuoteMessage = {
   quote_id: string;
   job_id: string;
   message: string;
-  source: "customer";
+  source: "customer" | "business";
   resolved_at: string | null;
   created_at: string;
 };

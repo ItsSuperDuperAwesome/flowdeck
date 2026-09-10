@@ -1,7 +1,18 @@
 import { logout } from "@/app/auth/actions";
 import { createBusiness } from "@/app/dashboard/actions";
 import { DashboardClient } from "@/app/dashboard/dashboard-client";
-import type { Business, Customer, CustomerSummary, IntakeField, Job, JobActivity, QuoteMessage } from "@/lib/job-tracker/types";
+import type {
+  Business,
+  BusinessDashboardWidget,
+  BusinessPipelineStatus,
+  BusinessServiceType,
+  Customer,
+  CustomerSummary,
+  IntakeField,
+  Job,
+  JobActivity,
+  QuoteMessage,
+} from "@/lib/job-tracker/types";
 import { createClient } from "@/lib/supabase/server";
 import { hasSupabaseConfig } from "@/lib/supabase/env";
 import { redirect } from "next/navigation";
@@ -87,6 +98,33 @@ export default async function Dashboard({
         .order("created_at", { ascending: true })
     : { data: [], error: null };
 
+  const { data: serviceTypeRows, error: serviceTypesError } = business
+    ? await supabase
+        .from("business_service_types")
+        .select("id, business_id, key, label, enabled, sort_order, created_at, updated_at")
+        .eq("business_id", business.id)
+        .order("sort_order", { ascending: true })
+        .order("created_at", { ascending: true })
+    : { data: [], error: null };
+
+  const { data: pipelineStatusRows, error: pipelineStatusesError } = business
+    ? await supabase
+        .from("business_pipeline_statuses")
+        .select("id, business_id, key, label, semantic_type, enabled, sort_order, created_at, updated_at")
+        .eq("business_id", business.id)
+        .order("sort_order", { ascending: true })
+        .order("created_at", { ascending: true })
+    : { data: [], error: null };
+
+  const { data: dashboardWidgetRows, error: dashboardWidgetsError } = business
+    ? await supabase
+        .from("business_dashboard_widgets")
+        .select("id, business_id, widget_key, label_override, enabled, sort_order, created_at, updated_at")
+        .eq("business_id", business.id)
+        .order("sort_order", { ascending: true })
+        .order("created_at", { ascending: true })
+    : { data: [], error: null };
+
   const { data: quoteMessageRows, error: quoteMessagesError } = business
     ? await supabase
         .from("quote_messages")
@@ -94,13 +132,24 @@ export default async function Dashboard({
           "id, business_id, quote_id, job_id, message, source, resolved_at, created_at, jobs(id, business_id, customer_id, title, description, status, price_cents, scheduled_start, scheduled_end, job_address, internal_notes, source, project_type, preferred_date, square_feet, budget_range, first_contact_at, quote_sent_at, won_at, next_follow_up_at, lost_at, completed_at, lost_reason, revenue_cents, intake_data, created_at, updated_at, customers(id, business_id, name, email, phone, address_line1, address_line2, city, state, postal_code, notes, created_at, updated_at))",
         )
         .eq("business_id", business.id)
+        .eq("source", "customer")
         .is("resolved_at", null)
         .order("created_at", { ascending: false })
         .limit(8)
     : { data: [], error: null };
 
   const schemaNeedsSetup =
-    Boolean(membershipError || customersError || jobsError || activityError || intakeFieldsError || quoteMessagesError);
+    Boolean(
+      membershipError ||
+        customersError ||
+        jobsError ||
+        activityError ||
+        intakeFieldsError ||
+        serviceTypesError ||
+        pipelineStatusesError ||
+        dashboardWidgetsError ||
+        quoteMessagesError,
+    );
 
   const jobs: Job[] = ((jobRows ?? []) as unknown as JobRow[]).map((job) => ({
     ...job,
@@ -154,6 +203,9 @@ export default async function Dashboard({
           business={business}
           customers={customers}
           intakeFields={intakeFields}
+          serviceTypes={(serviceTypeRows ?? []) as BusinessServiceType[]}
+          pipelineStatuses={(pipelineStatusRows ?? []) as BusinessPipelineStatus[]}
+          dashboardWidgets={(dashboardWidgetRows ?? []) as BusinessDashboardWidget[]}
           jobs={jobs}
           initialView={initialView}
           message={params.message}

@@ -1,4 +1,5 @@
 import { createClient } from "@supabase/supabase-js";
+import { defaultServiceTypes } from "@/lib/job-tracker/config";
 import { getSupabaseConfig } from "@/lib/supabase/env";
 import type { IntakeField, IntakeResponse } from "@/lib/job-tracker/types";
 import { NextResponse } from "next/server";
@@ -263,6 +264,15 @@ export async function POST(request: Request, context: { params: Promise<{ busine
   }
 
   const customFields = normalizeFields(formConfig.fields);
+  const configuredServices = ((formConfig as { service_types?: Array<{ label?: unknown }> }).service_types ?? [])
+    .map((service) => (typeof service.label === "string" ? service.label : ""))
+    .filter(Boolean);
+  const validServiceTypes = configuredServices.length ? configuredServices : defaultServiceTypes.map((service) => service.label);
+
+  if (!validServiceTypes.includes(serviceType)) {
+    return errorResponse("Please choose an available service type.");
+  }
+
   const customResult = validateCustomFields(formData, customFields);
 
   if ("error" in customResult) {

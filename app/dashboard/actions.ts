@@ -1,6 +1,7 @@
 "use server";
 
-import type { IntakeFieldType, JobFileCategory, JobSource, JobStatus, QuoteStatus } from "@/lib/job-tracker/types";
+import { dashboardWidgetRegistry, defaultDashboardWidgets, defaultPipelineStatuses, defaultServiceTypes } from "@/lib/job-tracker/config";
+import type { DashboardWidgetKey, IntakeFieldType, JobFileCategory, JobSource, JobStatus, QuoteStatus } from "@/lib/job-tracker/types";
 import { createClient } from "@/lib/supabase/server";
 import { randomBytes } from "crypto";
 import { revalidatePath } from "next/cache";
@@ -10,6 +11,7 @@ const validStatuses: JobStatus[] = ["lead", "contacted", "quoted", "scheduled", 
 const validQuoteStatuses: QuoteStatus[] = ["draft", "sent", "accepted", "declined"];
 const validIntakeFieldTypes: IntakeFieldType[] = ["short_text", "long_text", "number", "select", "checkbox", "date"];
 const validSources: JobSource[] = ["website_form", "google", "facebook", "instagram", "referral", "repeat_customer", "phone", "walk_in", "manual", "other"];
+const validDashboardWidgets = Object.keys(dashboardWidgetRegistry) as DashboardWidgetKey[];
 const validLostReasons = ["price", "no_response", "competitor", "timing", "canceled_project", "not_qualified", "other"];
 const confirmedStatuses: JobStatus[] = ["scheduled", "in_progress", "completed"];
 const maxPhotoCount = 5;
@@ -329,6 +331,39 @@ function fieldKeyFromLabel(label: string) {
     .slice(0, 40);
 }
 
+function configKeyFromLabel(label: string) {
+  return fieldKeyFromLabel(label) || "service";
+}
+
+async function seedWorkspaceConfig(supabase: Awaited<ReturnType<typeof createClient>>, businessId: string) {
+  await supabase.from("business_service_types").insert(
+    defaultServiceTypes.map((service, index) => ({
+      business_id: businessId,
+      key: service.key,
+      label: service.label,
+      sort_order: (index + 1) * 10,
+    })),
+  );
+
+  await supabase.from("business_pipeline_statuses").insert(
+    defaultPipelineStatuses.map((status, index) => ({
+      business_id: businessId,
+      key: status.key,
+      label: status.label,
+      semantic_type: status.semantic_type,
+      sort_order: (index + 1) * 10,
+    })),
+  );
+
+  await supabase.from("business_dashboard_widgets").insert(
+    defaultDashboardWidgets.map((widgetKey, index) => ({
+      business_id: businessId,
+      sort_order: (index + 1) * 10,
+      widget_key: widgetKey,
+    })),
+  );
+}
+
 function parseIntakeOptions(value: FormDataEntryValue | null) {
   return clean(value)
     .split(/\r?\n|,/)
@@ -449,6 +484,8 @@ export async function createBusiness(formData: FormData) {
     redirect(`/dashboard?message=${message(memberError.message)}`);
   }
 
+  await seedWorkspaceConfig(supabase, business.id);
+
   revalidatePath("/dashboard");
   redirect("/dashboard");
 }
@@ -550,6 +587,7 @@ export async function createJob(formData: FormData) {
   const submittedEnd = scheduleValue(formData.get("scheduledEndDate"), formData.get("scheduledEndTime"));
   const scheduledEnd = normalizeScheduledEnd(scheduledStart, submittedEnd);
   const source = (clean(formData.get("source")) || "manual") as JobSource;
+  const projectType = optional(formData.get("projectType"));
 
   if (!businessId || !customerId || !title) {
     redirect(`/dashboard?message=${message("Customer and job title are required.")}`);
@@ -610,6 +648,7 @@ export async function createJob(formData: FormData) {
       job_address: address,
       job_title: title,
       price_cents: priceCents,
+      project_type: projectType,
       revenue_cents: revenueForJob(status, priceCents, transitionUpdate.won_at as string | null | undefined),
       scheduled_date: scheduledStart ? scheduledStart.slice(0, 10) : null,
       scheduled_end: scheduledEnd,
@@ -663,6 +702,7 @@ export async function updateJob(formData: FormData) {
   const scheduledEnd = normalizeScheduledEnd(scheduledStart, submittedEnd);
   const priceCents = moneyToCents(formData.get("price"));
   const source = (clean(formData.get("source")) || "manual") as JobSource;
+  const projectType = optional(formData.get("projectType"));
 
   if (!customerId || !title) {
     redirect(`/jobs/${jobId}?message=${message("Customer and job title are required.")}`);
@@ -728,6 +768,7 @@ export async function updateJob(formData: FormData) {
       job_address: optional(formData.get("jobAddress")),
       job_title: title,
       price_cents: priceCents,
+      project_type: projectType,
       revenue_cents: revenueCents,
       scheduled_date: scheduledStart ? scheduledStart.slice(0, 10) : null,
       scheduled_end: scheduledEnd,
@@ -1389,6 +1430,84 @@ export async function resolveQuoteMessage(formData: FormData) {
   redirect(`/jobs/${quoteMessage.job_id}?message=${message("Quote question resolved.")}#quote`);
 }
 
+export async function sendQuoteReply(formData: FormData) {
+  const quoteId = clean(formData.get("quoteId"));
+  const reply = clean(formData.get("reply")).slice(0, 1000);
+
+  if (!quoteId) {
+    redirect(`/dashboard?message=${message("Could not find that quote.")}`);
+  }
+
+  if (!reply) {
+    redirect(`/dashboard?message=${message("Write a reply before sending.")}`);
+  }
+
+  const { supabase, userId } = await requireUser();
+  const { data: quote, error: quoteError } = await supabase
+    .from("quotes")
+    .select("id, business_id, job_id, public_token")
+    .eq("id", quoteId)
+    .single();
+
+  if (quoteError || !quote) {
+    redirect(`/dashboard?message=${message(quoteError?.message ?? "Could not load that quote.")}`);
+  }
+
+  const { data: existingReply } = await supabase
+    .from("quote_messages")
+    .select("id")
+    .eq("quote_id", quote.id)
+    .eq("source", "business")
+    .eq("message", reply)
+    .gte("created_at", new Date(Date.now() - 2 * 60_000).toISOString())
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (!existingReply) {
+    const { data: inserted, error: insertError } = await supabase
+      .from("quote_messages")
+      .insert({
+        business_id: quote.business_id,
+        job_id: quote.job_id,
+        message: reply,
+        quote_id: quote.id,
+        source: "business",
+      })
+      .select("id")
+      .single();
+
+    if (insertError || !inserted) {
+      redirect(`/jobs/${quote.job_id}?message=${message(insertError?.message ?? "Could not send that reply.")}#quote`);
+    }
+
+    await logActivity({
+      businessId: quote.business_id,
+      eventType: "quote_message_replied",
+      jobId: quote.job_id,
+      message: "Business replied to customer.",
+      metadata: { quote_id: quote.id, quote_message_id: inserted.id, source: "business", message: reply },
+      userId,
+    });
+  }
+
+  const { error: resolveError } = await supabase
+    .from("quote_messages")
+    .update({ resolved_at: new Date().toISOString() })
+    .eq("quote_id", quote.id)
+    .eq("source", "customer")
+    .is("resolved_at", null);
+
+  if (resolveError) {
+    redirect(`/jobs/${quote.job_id}?message=${message(resolveError.message)}#quote`);
+  }
+
+  revalidatePath("/dashboard");
+  revalidatePath(`/jobs/${quote.job_id}`);
+  revalidatePath(`/quote/${quote.public_token}`);
+  redirect(`/jobs/${quote.job_id}?message=${message(existingReply ? "Reply already sent." : "Reply sent.")}#quote`);
+}
+
 export async function uploadJobPhotos(formData: FormData) {
   const jobId = clean(formData.get("jobId"));
   const category = clean(formData.get("category")) as JobFileCategory;
@@ -1645,6 +1764,211 @@ export async function moveIntakeField(formData: FormData) {
 
   const { error: secondError } = await supabase
     .from("intake_fields")
+    .update({ sort_order: current.sort_order })
+    .eq("business_id", businessId)
+    .eq("id", target.id);
+
+  if (secondError) {
+    redirect(`/dashboard?view=Settings&message=${message(secondError.message)}`);
+  }
+
+  revalidatePath("/dashboard");
+  redirect(`/dashboard?view=Settings`);
+}
+
+export async function createServiceType(formData: FormData) {
+  const businessId = clean(formData.get("businessId"));
+  const label = clean(formData.get("label")).slice(0, 80);
+  const key = (clean(formData.get("key")) || configKeyFromLabel(label)).toLowerCase();
+
+  if (!businessId || !label) {
+    redirect(`/dashboard?view=Settings&message=${message("Service label is required.")}`);
+  }
+
+  if (!/^[a-z][a-z0-9_]{1,40}$/.test(key)) {
+    redirect(`/dashboard?view=Settings&message=${message("Use a stable key like window_cleaning.")}`);
+  }
+
+  const { supabase } = await requireBusinessAccess(businessId);
+  const { data: lastService } = await supabase
+    .from("business_service_types")
+    .select("sort_order")
+    .eq("business_id", businessId)
+    .order("sort_order", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  const { error } = await supabase.from("business_service_types").insert({
+    business_id: businessId,
+    enabled: true,
+    key,
+    label,
+    sort_order: Number(lastService?.sort_order ?? 0) + 10,
+  });
+
+  if (error) {
+    redirect(`/dashboard?view=Settings&message=${message(error.message)}`);
+  }
+
+  revalidatePath("/dashboard");
+  redirect(`/dashboard?view=Settings&message=${message("Service type added.")}`);
+}
+
+export async function updateServiceType(formData: FormData) {
+  const businessId = clean(formData.get("businessId"));
+  const serviceId = clean(formData.get("serviceId"));
+  const label = clean(formData.get("label")).slice(0, 80);
+
+  if (!businessId || !serviceId || !label) {
+    redirect(`/dashboard?view=Settings&message=${message("Service label is required.")}`);
+  }
+
+  const { supabase } = await requireBusinessAccess(businessId);
+  const { error } = await supabase
+    .from("business_service_types")
+    .update({ enabled: formData.get("enabled") === "on", label })
+    .eq("business_id", businessId)
+    .eq("id", serviceId);
+
+  if (error) {
+    redirect(`/dashboard?view=Settings&message=${message(error.message)}`);
+  }
+
+  revalidatePath("/dashboard");
+  redirect(`/dashboard?view=Settings&message=${message("Service type saved.")}`);
+}
+
+export async function archiveServiceType(formData: FormData) {
+  const businessId = clean(formData.get("businessId"));
+  const serviceId = clean(formData.get("serviceId"));
+
+  if (!businessId || !serviceId) {
+    redirect(`/dashboard?view=Settings&message=${message("Could not find that service type.")}`);
+  }
+
+  const { supabase } = await requireBusinessAccess(businessId);
+  const { error } = await supabase
+    .from("business_service_types")
+    .update({ enabled: false })
+    .eq("business_id", businessId)
+    .eq("id", serviceId);
+
+  if (error) {
+    redirect(`/dashboard?view=Settings&message=${message(error.message)}`);
+  }
+
+  revalidatePath("/dashboard");
+  redirect(`/dashboard?view=Settings&message=${message("Service type disabled.")}`);
+}
+
+export async function updatePipelineStatusConfig(formData: FormData) {
+  const businessId = clean(formData.get("businessId"));
+  const statusId = clean(formData.get("statusId"));
+  const label = clean(formData.get("label")).slice(0, 80);
+  const semanticType = clean(formData.get("semanticType")) as JobStatus;
+
+  if (!businessId || !statusId || !label || !validStatuses.includes(semanticType)) {
+    redirect(`/dashboard?view=Settings&message=${message("Could not update that pipeline status.")}`);
+  }
+
+  const cannotDisable = semanticType === "lead" || semanticType === "completed" || semanticType === "lost";
+  const { supabase } = await requireBusinessAccess(businessId);
+  const { error } = await supabase
+    .from("business_pipeline_statuses")
+    .update({ enabled: cannotDisable ? true : formData.get("enabled") === "on", label })
+    .eq("business_id", businessId)
+    .eq("id", statusId)
+    .eq("semantic_type", semanticType);
+
+  if (error) {
+    redirect(`/dashboard?view=Settings&message=${message(error.message)}`);
+  }
+
+  revalidatePath("/dashboard");
+  redirect(`/dashboard?view=Settings&message=${message("Pipeline status saved.")}`);
+}
+
+export async function updateDashboardWidgetConfig(formData: FormData) {
+  const businessId = clean(formData.get("businessId"));
+  const widgetId = clean(formData.get("widgetId"));
+  const widgetKey = clean(formData.get("widgetKey")) as DashboardWidgetKey;
+  const label = optional(formData.get("labelOverride"));
+
+  if (!businessId || !widgetId || !validDashboardWidgets.includes(widgetKey)) {
+    redirect(`/dashboard?view=Settings&message=${message("Could not update that dashboard item.")}`);
+  }
+
+  const { supabase } = await requireBusinessAccess(businessId);
+  const { error } = await supabase
+    .from("business_dashboard_widgets")
+    .update({
+      enabled: formData.get("enabled") === "on",
+      label_override: label ? label.slice(0, 80) : null,
+    })
+    .eq("business_id", businessId)
+    .eq("id", widgetId)
+    .eq("widget_key", widgetKey);
+
+  if (error) {
+    redirect(`/dashboard?view=Settings&message=${message(error.message)}`);
+  }
+
+  revalidatePath("/dashboard");
+  redirect(`/dashboard?view=Settings&message=${message("Dashboard item saved.")}`);
+}
+
+export async function moveConfigItem(formData: FormData) {
+  const businessId = clean(formData.get("businessId"));
+  const itemId = clean(formData.get("itemId"));
+  const direction = clean(formData.get("direction"));
+  const configType = clean(formData.get("configType"));
+
+  const table =
+    configType === "services"
+      ? "business_service_types"
+      : configType === "pipeline"
+        ? "business_pipeline_statuses"
+        : configType === "dashboard"
+          ? "business_dashboard_widgets"
+          : null;
+
+  if (!businessId || !itemId || !table || (direction !== "up" && direction !== "down")) {
+    redirect(`/dashboard?view=Settings&message=${message("Could not reorder that item.")}`);
+  }
+
+  const { supabase } = await requireBusinessAccess(businessId);
+  const { data: items, error: itemsError } = await supabase
+    .from(table)
+    .select("id, sort_order")
+    .eq("business_id", businessId)
+    .order("sort_order", { ascending: true })
+    .order("created_at", { ascending: true });
+
+  if (itemsError || !items?.length) {
+    redirect(`/dashboard?view=Settings&message=${message(itemsError?.message ?? "Could not load those settings.")}`);
+  }
+
+  const currentIndex = items.findIndex((item) => item.id === itemId);
+  const targetIndex = direction === "up" ? currentIndex - 1 : currentIndex + 1;
+
+  if (currentIndex < 0 || targetIndex < 0 || targetIndex >= items.length) {
+    redirect(`/dashboard?view=Settings`);
+  }
+
+  const current = items[currentIndex];
+  const target = items[targetIndex];
+  const { error: firstError } = await supabase
+    .from(table)
+    .update({ sort_order: target.sort_order })
+    .eq("business_id", businessId)
+    .eq("id", current.id);
+
+  if (firstError) {
+    redirect(`/dashboard?view=Settings&message=${message(firstError.message)}`);
+  }
+
+  const { error: secondError } = await supabase
+    .from(table)
     .update({ sort_order: current.sort_order })
     .eq("business_id", businessId)
     .eq("id", target.id);

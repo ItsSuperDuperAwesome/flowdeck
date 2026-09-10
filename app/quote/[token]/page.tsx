@@ -18,6 +18,13 @@ type PublicQuoteData = {
   declined_at?: string | null;
   valid_until?: string | null;
   expired?: boolean;
+  messages?: PublicQuoteMessage[];
+};
+
+type PublicQuoteMessage = {
+  source: "customer" | "business";
+  message: string;
+  created_at: string;
 };
 
 const quoteStatusLabels = {
@@ -140,6 +147,18 @@ export default async function PublicQuotePage({
               Send Message
             </button>
           </form>
+
+          {quote.messages?.length ? (
+            <section className="public-quote-thread">
+              <h2>Conversation</h2>
+              {quote.messages.map((quoteMessage, index) => (
+                <article className={`public-quote-message public-quote-message-${quoteMessage.source}`} key={`${quoteMessage.created_at}-${index}`}>
+                  <span>{quoteMessage.source === "business" ? quote.business_name ?? "Business" : "You"} · {dateLabel(quoteMessage.created_at)}</span>
+                  <p>{quoteMessage.message}</p>
+                </article>
+              ))}
+            </section>
+          ) : null}
         </section>
         <footer>
           <Link href="/">Job Tracker</Link>
