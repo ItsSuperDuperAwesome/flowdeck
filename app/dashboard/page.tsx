@@ -1,7 +1,7 @@
 import { logout } from "@/app/auth/actions";
 import { createBusiness } from "@/app/dashboard/actions";
 import { DashboardClient } from "@/app/dashboard/dashboard-client";
-import type { Business, Customer, CustomerSummary, IntakeField, Job, JobActivity } from "@/lib/job-tracker/types";
+import type { Business, Customer, CustomerSummary, IntakeField, Job, JobActivity, QuoteMessage } from "@/lib/job-tracker/types";
 import { createClient } from "@/lib/supabase/server";
 import { hasSupabaseConfig } from "@/lib/supabase/env";
 import { redirect } from "next/navigation";
@@ -14,6 +14,10 @@ type JobRow = Omit<Job, "customer"> & {
 
 type ActivityRow = Omit<JobActivity, "job"> & {
   jobs: Pick<Job, "id" | "title" | "status"> | Pick<Job, "id" | "title" | "status">[] | null;
+};
+
+type QuoteMessageRow = QuoteMessage & {
+  jobs: JobRow | JobRow[] | null;
 };
 
 export default async function Dashboard({
@@ -83,8 +87,20 @@ export default async function Dashboard({
         .order("created_at", { ascending: true })
     : { data: [], error: null };
 
+  const { data: quoteMessageRows, error: quoteMessagesError } = business
+    ? await supabase
+        .from("quote_messages")
+        .select(
+          "id, business_id, quote_id, job_id, message, source, resolved_at, created_at, jobs(id, business_id, customer_id, title, description, status, price_cents, scheduled_start, scheduled_end, job_address, internal_notes, source, project_type, preferred_date, square_feet, budget_range, first_contact_at, quote_sent_at, won_at, next_follow_up_at, lost_at, completed_at, lost_reason, revenue_cents, intake_data, created_at, updated_at, customers(id, business_id, name, email, phone, address_line1, address_line2, city, state, postal_code, notes, created_at, updated_at))",
+        )
+        .eq("business_id", business.id)
+        .is("resolved_at", null)
+        .order("created_at", { ascending: false })
+        .limit(8)
+    : { data: [], error: null };
+
   const schemaNeedsSetup =
-    Boolean(membershipError || customersError || jobsError || activityError || intakeFieldsError);
+    Boolean(membershipError || customersError || jobsError || activityError || intakeFieldsError || quoteMessagesError);
 
   const jobs: Job[] = ((jobRows ?? []) as unknown as JobRow[]).map((job) => ({
     ...job,
@@ -100,6 +116,19 @@ export default async function Dashboard({
     ...field,
     options: Array.isArray(field.options) ? field.options : [],
   }));
+  const quoteMessages = ((quoteMessageRows ?? []) as unknown as QuoteMessageRow[]).map((quoteMessage) => {
+    const rowJob = Array.isArray(quoteMessage.jobs) ? quoteMessage.jobs[0] ?? null : quoteMessage.jobs;
+
+    return {
+      ...quoteMessage,
+      job: rowJob
+        ? {
+            ...rowJob,
+            customer: Array.isArray(rowJob.customers) ? rowJob.customers[0] ?? null : rowJob.customers,
+          }
+        : null,
+    };
+  });
 
   return (
     <main className="app-page">
@@ -128,6 +157,7 @@ export default async function Dashboard({
           jobs={jobs}
           initialView={initialView}
           message={params.message}
+          quoteMessages={quoteMessages}
           userEmail={email}
         />
       ) : (

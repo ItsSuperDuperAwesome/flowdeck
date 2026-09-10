@@ -8,6 +8,7 @@ import {
   createJob,
   markJobContacted,
   moveIntakeField,
+  resolveQuoteMessage,
   updateBusiness,
   updateCustomer,
   updateIntakeField,
@@ -15,7 +16,7 @@ import {
   updateJob,
   updateJobStatus,
 } from "@/app/dashboard/actions";
-import type { Business, Customer, CustomerSummary, IntakeField, IntakeFieldType, Job, JobActivity, JobSource, JobStatus } from "@/lib/job-tracker/types";
+import type { Business, Customer, CustomerSummary, IntakeField, IntakeFieldType, Job, JobActivity, JobSource, JobStatus, QuoteMessage } from "@/lib/job-tracker/types";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import type { KeyboardEvent, MouseEvent } from "react";
@@ -31,7 +32,8 @@ type AttentionItem = {
   job: Job;
   priority: number;
   problem: string;
-  quickAction?: "contacted";
+  quoteMessage?: QuoteMessage;
+  quickAction?: "contacted" | "resolve_quote_message";
 };
 type AttentionSeverity = "high" | "warning" | "info";
 
@@ -43,6 +45,7 @@ type DashboardClientProps = {
   initialView?: View;
   jobs: Job[];
   message?: string;
+  quoteMessages: (QuoteMessage & { job: Job | null })[];
   userEmail: string;
 };
 
@@ -191,11 +194,28 @@ function daysSince(value: string) {
   return Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 86_400_000));
 }
 
-function buildAttentionItems(jobs: Job[]): AttentionItem[] {
+function buildAttentionItems(jobs: Job[], quoteMessages: (QuoteMessage & { job: Job | null })[]): AttentionItem[] {
   const now = Date.now();
   const staleQuoteMs = 3 * 86_400_000;
   const soonMs = 7 * 86_400_000;
   const items: AttentionItem[] = [];
+
+  quoteMessages.forEach((quoteMessage) => {
+    if (!quoteMessage.job || quoteMessage.resolved_at) {
+      return;
+    }
+
+    items.push({
+      action: "Review the question and follow up with the customer.",
+      age: ageLabel(quoteMessage.created_at),
+      id: `${quoteMessage.id}-quote-message`,
+      job: quoteMessage.job,
+      priority: 0,
+      problem: "Customer has a question about a quote",
+      quoteMessage,
+      quickAction: "resolve_quote_message",
+    });
+  });
 
   jobs.forEach((job) => {
     if (job.status === "completed" || job.status === "lost") {
@@ -398,6 +418,7 @@ export function DashboardClient({
   initialView,
   jobs,
   message,
+  quoteMessages,
   userEmail,
 }: DashboardClientProps) {
   const [activeView, setActiveView] = useState<View>(initialView ?? "Overview");
@@ -486,7 +507,7 @@ export function DashboardClient({
     .filter((job) => job.scheduled_start && operationalStatuses.includes(job.status))
     .sort((a, b) => String(a.scheduled_start).localeCompare(String(b.scheduled_start)))
     .slice(0, 5);
-  const needsAttention = useMemo(() => buildAttentionItems(jobs), [jobs]);
+  const needsAttention = useMemo(() => buildAttentionItems(jobs, quoteMessages), [jobs, quoteMessages]);
 
   const showSearch = activeView === "Overview" || activeView === "Pipeline" || activeView === "Jobs" || activeView === "Customers";
 
@@ -755,8 +776,17 @@ function NeedsAttentionPanel({ items, onViewJobs }: { items: AttentionItem[]; on
                   {item.quickAction === "contacted" ? (
                     <form action={markJobContacted}>
                       <input type="hidden" name="jobId" value={item.job.id} />
+                      <input type="hidden" name="returnTo" value="/dashboard" />
                       <button className="link-button" type="submit">
                         Mark Contacted
+                      </button>
+                    </form>
+                  ) : null}
+                  {item.quickAction === "resolve_quote_message" && item.quoteMessage ? (
+                    <form action={resolveQuoteMessage}>
+                      <input type="hidden" name="messageId" value={item.quoteMessage.id} />
+                      <button className="link-button" type="submit">
+                        Mark Answered
                       </button>
                     </form>
                   ) : null}

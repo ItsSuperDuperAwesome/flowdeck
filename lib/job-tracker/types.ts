@@ -127,12 +127,26 @@ export type Quote = {
   amount_cents: number;
   notes: string | null;
   status: QuoteStatus;
+  public_token: string;
+  public_token_created_at: string | null;
+  public_access_revoked_at: string | null;
   sent_at: string | null;
   accepted_at: string | null;
   declined_at: string | null;
   valid_until: string | null;
   created_at: string;
   updated_at: string;
+};
+
+export type QuoteMessage = {
+  id: string;
+  business_id: string;
+  quote_id: string;
+  job_id: string;
+  message: string;
+  source: "customer";
+  resolved_at: string | null;
+  created_at: string;
 };
 
 export type CustomerSummary = Customer & {

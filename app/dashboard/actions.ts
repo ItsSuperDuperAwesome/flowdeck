@@ -2,6 +2,7 @@
 
 import type { IntakeFieldType, JobFileCategory, JobSource, JobStatus, QuoteStatus } from "@/lib/job-tracker/types";
 import { createClient } from "@/lib/supabase/server";
+import { randomBytes } from "crypto";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 
@@ -42,9 +43,23 @@ function optional(value: FormDataEntryValue | null) {
   return cleaned || null;
 }
 
+function internalRedirectTarget(value: FormDataEntryValue | null, fallback: string) {
+  const target = clean(value);
+
+  if (target.startsWith("/") && !target.startsWith("//") && !target.includes("://")) {
+    return target;
+  }
+
+  return fallback;
+}
+
 function moneyToCents(value: FormDataEntryValue | null) {
   const amount = Number(String(value ?? "0").replace(/[$,]/g, ""));
   return Number.isFinite(amount) ? Math.max(0, Math.round(amount * 100)) : 0;
+}
+
+function publicQuoteToken() {
+  return randomBytes(32).toString("hex");
 }
 
 function extensionForMime(type: string) {
@@ -375,7 +390,7 @@ async function requireQuoteForJob(quoteId: string, jobId: string) {
   const { supabase, userId } = await requireUser();
   const { data: quote, error: quoteError } = await supabase
     .from("quotes")
-    .select("id, business_id, job_id, amount_cents, status, sent_at, accepted_at, declined_at")
+    .select("id, business_id, job_id, amount_cents, status, public_token, public_token_created_at, public_access_revoked_at, sent_at, accepted_at, declined_at")
     .eq("id", quoteId)
     .eq("job_id", jobId)
     .single();
@@ -857,6 +872,8 @@ export async function markJobContacted(formData: FormData) {
     redirect(`/dashboard?message=${message("Could not find that job.")}`);
   }
 
+  const returnTo = internalRedirectTarget(formData.get("returnTo"), `/jobs/${jobId}?message=${message("Contact recorded.")}`);
+
   const { supabase, userId } = await requireUser();
   const { data: current, error: currentError } = await supabase
     .from("jobs")
@@ -876,27 +893,31 @@ export async function markJobContacted(formData: FormData) {
     currentWonAt: current.won_at,
     nextStatus,
   });
-  const { error } = await supabase
-    .from("jobs")
-    .update(update)
-    .eq("id", jobId);
+  const shouldRecordContact = !current.first_contact_at || current.status === "lead";
 
-  if (error) {
-    redirect(`/jobs/${jobId}?message=${message(error.message)}`);
+  if (shouldRecordContact) {
+    const { error } = await supabase
+      .from("jobs")
+      .update(update)
+      .eq("id", jobId);
+
+    if (error) {
+      redirect(`/jobs/${jobId}?message=${message(error.message)}`);
+    }
+
+    await logActivity({
+      businessId: current.business_id,
+      eventType: "contacted",
+      jobId,
+      message: current.first_contact_at ? "Customer contact confirmed." : "First contact recorded.",
+      metadata: { first_contact_at: update.first_contact_at ?? current.first_contact_at, from: current.status, to: nextStatus },
+      userId,
+    });
   }
-
-  await logActivity({
-    businessId: current.business_id,
-    eventType: "contacted",
-    jobId,
-    message: current.first_contact_at ? "Customer contact confirmed." : "First contact recorded.",
-    metadata: { first_contact_at: update.first_contact_at ?? current.first_contact_at, from: current.status, to: nextStatus },
-    userId,
-  });
 
   revalidatePath("/dashboard");
   revalidatePath(`/jobs/${jobId}`);
-  redirect(`/jobs/${jobId}?message=${message("Contact recorded.")}`);
+  redirect(returnTo);
 }
 
 export async function markJobQuoted(formData: FormData) {
@@ -1090,6 +1111,7 @@ export async function saveQuote(formData: FormData) {
           ...quotePayload,
           business_id: job.business_id,
           job_id: jobId,
+          public_token: publicQuoteToken(),
           status: "draft",
         })
         .select("id, status")
@@ -1152,6 +1174,8 @@ export async function markQuoteSent(formData: FormData) {
     .update({
       accepted_at: null,
       declined_at: null,
+      public_token: quote.public_token ?? publicQuoteToken(),
+      public_access_revoked_at: null,
       sent_at: sentAt,
       status: "sent",
     })
@@ -1318,6 +1342,51 @@ export async function markQuoteDeclined(formData: FormData) {
   revalidatePath("/dashboard");
   revalidatePath(`/jobs/${jobId}`);
   redirect(`/jobs/${jobId}?message=${message("Quote declined.")}`);
+}
+
+export async function resolveQuoteMessage(formData: FormData) {
+  const messageId = clean(formData.get("messageId"));
+
+  if (!messageId) {
+    redirect(`/dashboard?message=${message("Could not find that quote message.")}`);
+  }
+
+  const { supabase, userId } = await requireUser();
+  const { data: quoteMessage, error: messageError } = await supabase
+    .from("quote_messages")
+    .select("id, business_id, quote_id, job_id, resolved_at")
+    .eq("id", messageId)
+    .single();
+
+  if (messageError || !quoteMessage) {
+    redirect(`/dashboard?message=${message(messageError?.message ?? "Could not load that quote message.")}`);
+  }
+
+  if (!quoteMessage.resolved_at) {
+    const resolvedAt = new Date().toISOString();
+    const { error } = await supabase
+      .from("quote_messages")
+      .update({ resolved_at: resolvedAt })
+      .eq("id", messageId)
+      .is("resolved_at", null);
+
+    if (error) {
+      redirect(`/jobs/${quoteMessage.job_id}?message=${message(error.message)}`);
+    }
+
+    await logActivity({
+      businessId: quoteMessage.business_id,
+      eventType: "quote_message_resolved",
+      jobId: quoteMessage.job_id,
+      message: "Quote question resolved.",
+      metadata: { quote_id: quoteMessage.quote_id, quote_message_id: quoteMessage.id, resolved_at: resolvedAt },
+      userId,
+    });
+  }
+
+  revalidatePath("/dashboard");
+  revalidatePath(`/jobs/${quoteMessage.job_id}`);
+  redirect(`/jobs/${quoteMessage.job_id}?message=${message("Quote question resolved.")}#quote`);
 }
 
 export async function uploadJobPhotos(formData: FormData) {

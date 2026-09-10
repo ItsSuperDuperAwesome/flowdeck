@@ -1,17 +1,19 @@
 import { JobFields } from "@/app/dashboard/dashboard-client";
 import { PhotoUploadForm } from "@/app/jobs/[id]/photo-upload-form";
+import { QuoteShareLink } from "@/app/jobs/[id]/quote-share-link";
 import {
   markJobContacted,
   markJobLost,
   markQuoteAccepted,
   markQuoteDeclined,
   markQuoteSent,
+  resolveQuoteMessage,
   saveQuote,
   setJobFollowUp,
   updateJob,
   updateJobStatus,
 } from "@/app/dashboard/actions";
-import type { Customer, CustomerSummary, IntakeResponse, Job, JobActivity, JobFile, JobSource, JobStatus, Quote, QuoteStatus } from "@/lib/job-tracker/types";
+import type { Customer, CustomerSummary, IntakeResponse, Job, JobActivity, JobFile, JobSource, JobStatus, Quote, QuoteMessage, QuoteStatus } from "@/lib/job-tracker/types";
 import { createClient } from "@/lib/supabase/server";
 import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
@@ -207,13 +209,23 @@ export default async function JobDetail({
 
   const { data: quoteRows } = await supabase
     .from("quotes")
-    .select("id, business_id, job_id, amount_cents, notes, status, sent_at, accepted_at, declined_at, valid_until, created_at, updated_at")
+    .select("id, business_id, job_id, amount_cents, notes, status, public_token, public_token_created_at, public_access_revoked_at, sent_at, accepted_at, declined_at, valid_until, created_at, updated_at")
     .eq("job_id", id)
     .eq("business_id", job.business_id)
     .order("created_at", { ascending: false })
     .limit(1);
 
   const quote = ((quoteRows ?? []) as Quote[])[0] ?? null;
+
+  const { data: quoteMessageRows } = quote
+    ? await supabase
+        .from("quote_messages")
+        .select("id, business_id, quote_id, job_id, message, source, resolved_at, created_at")
+        .eq("quote_id", quote.id)
+        .eq("business_id", job.business_id)
+        .order("created_at", { ascending: false })
+    : { data: [] };
+  const quoteMessages = (quoteMessageRows ?? []) as QuoteMessage[];
 
   const { data: activityRows } = await supabase
     .from("job_activity")
@@ -309,7 +321,7 @@ export default async function JobDetail({
           </section>
         </section>
 
-        <QuotePanel job={job} quote={quote} />
+        <QuotePanel job={job} quote={quote} quoteMessages={quoteMessages} />
 
         <JobQuickActions job={job} />
 
@@ -515,11 +527,13 @@ function PrimaryJobAction({ job }: { job: Job }) {
   );
 }
 
-function QuotePanel({ job, quote }: { job: Job; quote: Quote | null }) {
+function QuotePanel({ job, quote, quoteMessages }: { job: Job; quote: Quote | null; quoteMessages: QuoteMessage[] }) {
   const isClosed = job.status === "completed" || job.status === "lost";
   const canSend = quote && quote.status === "draft";
   const canAccept = quote && quote.status !== "accepted" && quote.status !== "declined";
   const canDecline = quote && quote.status !== "accepted" && quote.status !== "declined";
+  const publicHref = quote?.public_token ? `/quote/${quote.public_token}` : null;
+  const unresolvedMessages = quoteMessages.filter((message) => !message.resolved_at);
 
   return (
     <section className="data-panel quote-panel" id="quote">
@@ -537,6 +551,7 @@ function QuotePanel({ job, quote }: { job: Job; quote: Quote | null }) {
           <Info label="Valid until" value={quote.valid_until ? dateLabel(quote.valid_until) : "Not set"} />
           <Info label="Sent" value={quote.sent_at ? dateLabel(quote.sent_at) : "Not sent"} />
           <Info label="Current job value" value={money(job.price_cents)} />
+          <Info label="Customer response" value={quote.accepted_at ? `Accepted ${dateLabel(quote.accepted_at)}` : quote.declined_at ? `Declined ${dateLabel(quote.declined_at)}` : "Awaiting response"} />
         </div>
       ) : (
         <div className="quote-empty">
@@ -600,6 +615,47 @@ function QuotePanel({ job, quote }: { job: Job; quote: Quote | null }) {
               </button>
             </form>
           ) : null}
+        </div>
+      ) : null}
+
+      {quote && publicHref ? (
+        <div className="quote-customer-area">
+          <div className="panel-heading compact">
+            <div>
+              <h3>Customer link</h3>
+              <p className="muted">Share this link after marking the quote sent.</p>
+            </div>
+            <Link className="link-button" href={publicHref} target="_blank">
+              Open customer view
+            </Link>
+          </div>
+          <QuoteShareLink href={publicHref} />
+          {unresolvedMessages.length ? (
+            <p className="quote-message-alert">{unresolvedMessages.length === 1 ? "1 customer question needs an answer." : `${unresolvedMessages.length} customer questions need an answer.`}</p>
+          ) : null}
+        </div>
+      ) : null}
+
+      {quoteMessages.length ? (
+        <div className="quote-messages">
+          <h3>Customer quote messages</h3>
+          {quoteMessages.map((quoteMessage) => (
+            <article className={quoteMessage.resolved_at ? "quote-message resolved" : "quote-message"} key={quoteMessage.id}>
+              <div>
+                <span>{dateTimeLabel(quoteMessage.created_at)}</span>
+                <p>{quoteMessage.message}</p>
+                {quoteMessage.resolved_at ? <em>Answered {dateLabel(quoteMessage.resolved_at)}</em> : <em>Waiting for an answer</em>}
+              </div>
+              {!quoteMessage.resolved_at ? (
+                <form action={resolveQuoteMessage}>
+                  <input type="hidden" name="messageId" value={quoteMessage.id} />
+                  <button className="button button-secondary" type="submit">
+                    Mark Answered
+                  </button>
+                </form>
+              ) : null}
+            </article>
+          ))}
         </div>
       ) : null}
     </section>

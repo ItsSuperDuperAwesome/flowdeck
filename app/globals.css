@@ -2114,6 +2114,80 @@ p {
   padding: 12px 13px 13px;
 }
 
+.quote-customer-area,
+.quote-messages {
+  display: grid;
+  gap: 10px;
+  border-top: 1px solid var(--line);
+  padding: 12px 13px 13px;
+}
+
+.quote-customer-area h3,
+.quote-messages h3 {
+  margin: 0;
+  color: var(--foreground);
+  font-size: 0.96rem;
+  letter-spacing: 0;
+}
+
+.quote-share {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.quote-share input {
+  width: 100%;
+  min-height: 40px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  padding: 9px 10px;
+  background: var(--surface-soft);
+  color: var(--muted);
+  font: inherit;
+}
+
+.quote-message-alert {
+  margin: 0;
+  border: 1px solid rgba(217, 119, 6, 0.22);
+  border-radius: var(--radius-sm);
+  padding: 10px 11px;
+  background: rgba(245, 158, 11, 0.1);
+  color: #92400e;
+  font-size: 0.88rem;
+  font-weight: 850;
+}
+
+.quote-message {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 11px;
+  background: #fff;
+}
+
+.quote-message.resolved {
+  background: var(--surface-soft);
+}
+
+.quote-message span,
+.quote-message em {
+  display: block;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-style: normal;
+  font-weight: 800;
+}
+
+.quote-message p {
+  margin: 5px 0;
+  color: var(--foreground);
+  line-height: 1.55;
+}
+
 .quote-status {
   display: inline-flex;
   align-items: center;
@@ -2380,6 +2454,105 @@ p {
   color: var(--muted);
   font-size: 1.08rem;
   line-height: 1.65;
+}
+
+.quote-public-card {
+  display: grid;
+  gap: 20px;
+}
+
+.public-quote-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.public-quote-summary div {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 14px;
+  background: var(--surface-soft);
+}
+
+.public-quote-summary span {
+  display: block;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.public-quote-summary strong {
+  display: block;
+  margin-top: 5px;
+  color: var(--foreground);
+  font-size: 1.08rem;
+}
+
+.public-quote-scope {
+  display: grid;
+  gap: 8px;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  padding: 16px 0;
+}
+
+.public-quote-scope h2 {
+  margin: 0;
+  color: var(--foreground);
+  font-size: 1rem;
+}
+
+.public-quote-scope p,
+.quote-expired,
+.quote-accepted,
+.quote-declined {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.65;
+}
+
+.quote-expired {
+  color: #92400e;
+}
+
+.quote-accepted {
+  color: #166534;
+}
+
+.quote-declined {
+  color: #991b1b;
+}
+
+.public-quote-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.public-quote-message-form {
+  display: grid;
+  gap: 10px;
+}
+
+.public-quote-message-form label {
+  display: grid;
+  gap: 8px;
+  color: var(--foreground);
+  font-size: 0.9rem;
+  font-weight: 850;
+}
+
+.public-quote-message-form textarea {
+  width: 100%;
+  min-height: 112px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  padding: 11px 12px;
+  background: #fff;
+  color: var(--foreground);
+  font: inherit;
+  resize: vertical;
 }
 
 .public-intake-form {
