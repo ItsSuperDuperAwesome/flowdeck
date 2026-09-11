@@ -6,6 +6,7 @@ import type {
   BusinessDashboardWidget,
   BusinessPipelineStatus,
   BusinessServiceType,
+  BusinessTerminology,
   Customer,
   CustomerSummary,
   IntakeField,
@@ -125,6 +126,14 @@ export default async function Dashboard({
         .order("created_at", { ascending: true })
     : { data: [], error: null };
 
+  const { data: terminologyRow, error: terminologyError } = business
+    ? await supabase
+        .from("business_terminology")
+        .select("id, business_id, job_singular, job_plural, customer_singular, customer_plural, quote_singular, quote_plural, active_board_title, upcoming_title, new_job_button_label, new_customer_button_label, created_at, updated_at")
+        .eq("business_id", business.id)
+        .maybeSingle()
+    : { data: null, error: null };
+
   const { data: quoteMessageRows, error: quoteMessagesError } = business
     ? await supabase
         .from("quote_messages")
@@ -206,6 +215,7 @@ export default async function Dashboard({
           serviceTypes={(serviceTypeRows ?? []) as BusinessServiceType[]}
           pipelineStatuses={(pipelineStatusRows ?? []) as BusinessPipelineStatus[]}
           dashboardWidgets={(dashboardWidgetRows ?? []) as BusinessDashboardWidget[]}
+          terminology={(terminologyRow ?? null) as BusinessTerminology | null}
           jobs={jobs}
           initialView={initialView}
           message={params.message}

@@ -1,6 +1,6 @@
 "use server";
 
-import { dashboardWidgetRegistry, defaultDashboardWidgets, defaultPipelineStatuses, defaultServiceTypes } from "@/lib/job-tracker/config";
+import { dashboardWidgetRegistry, defaultDashboardWidgets, defaultPipelineStatuses, defaultServiceTypes, defaultTerminology } from "@/lib/job-tracker/config";
 import type { DashboardWidgetKey, IntakeFieldType, JobFileCategory, JobSource, JobStatus, QuoteStatus } from "@/lib/job-tracker/types";
 import { createClient } from "@/lib/supabase/server";
 import { randomBytes } from "crypto";
@@ -362,6 +362,21 @@ async function seedWorkspaceConfig(supabase: Awaited<ReturnType<typeof createCli
       widget_key: widgetKey,
     })),
   );
+
+  await supabase.from("business_terminology").insert({
+    business_id: businessId,
+    customer_plural: defaultTerminology.customer_plural,
+    customer_singular: defaultTerminology.customer_singular,
+    job_plural: defaultTerminology.job_plural,
+    job_singular: defaultTerminology.job_singular,
+    quote_plural: defaultTerminology.quote_plural,
+    quote_singular: defaultTerminology.quote_singular,
+  });
+}
+
+function terminologyTerm(formData: FormData, key: string, fallback: string) {
+  const value = clean(formData.get(key)).slice(0, 40);
+  return value || fallback;
 }
 
 function parseIntakeOptions(value: FormDataEntryValue | null) {
@@ -1606,6 +1621,45 @@ export async function updateBusiness(formData: FormData) {
 
   revalidatePath("/dashboard");
   redirect(`/dashboard?message=${message("Workspace updated.")}`);
+}
+
+export async function updateTerminology(formData: FormData) {
+  const businessId = clean(formData.get("businessId"));
+
+  if (!businessId) {
+    redirect(`/dashboard?view=Settings&message=${message("Could not find that workspace.")}`);
+  }
+
+  const payload = {
+    active_board_title: optional(formData.get("activeBoardTitle"))?.slice(0, 40) ?? null,
+    customer_plural: terminologyTerm(formData, "customerPlural", defaultTerminology.customer_plural),
+    customer_singular: terminologyTerm(formData, "customerSingular", defaultTerminology.customer_singular),
+    job_plural: terminologyTerm(formData, "jobPlural", defaultTerminology.job_plural),
+    job_singular: terminologyTerm(formData, "jobSingular", defaultTerminology.job_singular),
+    new_customer_button_label: optional(formData.get("newCustomerButtonLabel"))?.slice(0, 40) ?? null,
+    new_job_button_label: optional(formData.get("newJobButtonLabel"))?.slice(0, 40) ?? null,
+    quote_plural: terminologyTerm(formData, "quotePlural", defaultTerminology.quote_plural),
+    quote_singular: terminologyTerm(formData, "quoteSingular", defaultTerminology.quote_singular),
+    upcoming_title: optional(formData.get("upcomingTitle"))?.slice(0, 40) ?? null,
+  };
+
+  const values = Object.values(payload).filter((value): value is string => typeof value === "string");
+
+  if (values.some((value) => value.length < 1 || value.length > 40)) {
+    redirect(`/dashboard?view=Settings&message=${message("Terminology labels must be 1-40 characters.")}`);
+  }
+
+  const { supabase } = await requireBusinessAccess(businessId);
+  const { error } = await supabase
+    .from("business_terminology")
+    .upsert({ business_id: businessId, ...payload }, { onConflict: "business_id" });
+
+  if (error) {
+    redirect(`/dashboard?view=Settings&message=${message(error.message)}`);
+  }
+
+  revalidatePath("/dashboard");
+  redirect(`/dashboard?view=Settings&message=${message("Terminology saved.")}`);
 }
 
 export async function updateIntakeSettings(formData: FormData) {

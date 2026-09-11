@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 
-export function QuoteShareLink({ href }: { href: string }) {
+export function QuoteShareLink({ customerLabel, href, quoteLabel }: { customerLabel: string; href: string; quoteLabel: string }) {
   const [copied, setCopied] = useState(false);
 
   async function copyLink() {
@@ -14,9 +14,9 @@ export function QuoteShareLink({ href }: { href: string }) {
 
   return (
     <div className="quote-share">
-      <input aria-label="Customer quote link" readOnly value={href} />
+      <input aria-label={`${customerLabel} ${quoteLabel} link`} readOnly value={href} />
       <button className="button button-secondary" onClick={copyLink} type="button">
-        {copied ? "Copied" : "Copy customer link"}
+        {copied ? "Copied" : `Copy ${customerLabel.toLowerCase()} link`}
       </button>
     </div>
   );

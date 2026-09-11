@@ -1,5 +1,5 @@
 import { createClient } from "@supabase/supabase-js";
-import { defaultServiceTypes } from "@/lib/job-tracker/config";
+import { defaultServiceTypes, normalizeTerminology } from "@/lib/job-tracker/config";
 import { getSupabaseConfig } from "@/lib/supabase/env";
 import type { IntakeField } from "@/lib/job-tracker/types";
 import Link from "next/link";
@@ -15,6 +15,7 @@ type IntakeFormData = {
   description?: string;
   fields?: IntakeField[];
   service_types?: Array<{ key: string; label: string; sort_order: number }>;
+  terminology?: Record<string, string | null>;
 };
 
 function supabase() {
@@ -48,6 +49,7 @@ export default async function PublicIntakePage({ params }: { params: Promise<{ b
           }))}
           description={form.description ?? "Share a few details and we will follow up with next steps."}
           serviceTypes={(form.service_types?.length ? form.service_types : defaultServiceTypes).map((service) => service.label)}
+          terminology={normalizeTerminology(form.terminology)}
           title={form.title ?? "Tell us about your project"}
         />
         <footer>

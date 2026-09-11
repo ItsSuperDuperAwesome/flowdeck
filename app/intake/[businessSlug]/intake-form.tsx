@@ -1,5 +1,6 @@
 "use client";
 
+import { lowerTerm, normalizeTerminology, type Terminology } from "@/lib/job-tracker/config";
 import type { IntakeField } from "@/lib/job-tracker/types";
 import { useMemo, useState } from "react";
 
@@ -9,6 +10,7 @@ type IntakeFormProps = {
   customFields: IntakeField[];
   description: string;
   serviceTypes: string[];
+  terminology?: Terminology;
   title: string;
 };
 
@@ -17,7 +19,7 @@ const maxPhotoCount = 5;
 const maxPhotoSize = 10 * 1024 * 1024;
 const allowedPhotoTypes = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
 
-export function IntakeForm({ businessName, businessSlug, customFields, description, serviceTypes, title }: IntakeFormProps) {
+export function IntakeForm({ businessName, businessSlug, customFields, description, serviceTypes, terminology = normalizeTerminology(), title }: IntakeFormProps) {
   const [error, setError] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [success, setSuccess] = useState("");
@@ -66,7 +68,7 @@ export function IntakeForm({ businessName, businessSlug, customFields, descripti
         <p className="eyebrow">{businessName}</p>
         <h1>{hasUploadWarning ? "Request received, but photos need attention." : "Thanks — your request was received."}</h1>
         <p>{success}</p>
-        <p>{businessName} will review your project details and get back to you.</p>
+        <p>{businessName} will review your details and get back to you.</p>
       </section>
     );
   }
@@ -96,7 +98,7 @@ export function IntakeForm({ businessName, businessSlug, customFields, descripti
           </div>
         </div>
         <div className="field">
-          <label htmlFor="serviceType">Service/project type</label>
+          <label htmlFor="serviceType">Service / {lowerTerm(terminology.job_singular)} type</label>
           <select id="serviceType" name="serviceType" required>
             <option value="">Select one</option>
             {serviceTypes.map((type) => (
@@ -107,8 +109,8 @@ export function IntakeForm({ businessName, businessSlug, customFields, descripti
           </select>
         </div>
         <div className="field">
-          <label htmlFor="projectDescription">Project description</label>
-          <textarea id="projectDescription" name="projectDescription" placeholder="Tell us about the space, timeline, current condition, and anything important." required />
+          <label htmlFor="projectDescription">{terminology.job_singular} description</label>
+          <textarea id="projectDescription" name="projectDescription" placeholder="Tell us about the scope, timeline, current condition, and anything important." required />
         </div>
         <div className="field">
           <label htmlFor="streetAddress">Street address</label>
@@ -130,7 +132,7 @@ export function IntakeForm({ businessName, businessSlug, customFields, descripti
         </div>
         <div className="split-fields">
           <div className="field">
-            <label htmlFor="preferredDate">Preferred project date</label>
+            <label htmlFor="preferredDate">Preferred {lowerTerm(terminology.job_singular)} date</label>
             <input id="preferredDate" name="preferredDate" type="date" />
           </div>
           <div className="field">
@@ -156,7 +158,7 @@ export function IntakeForm({ businessName, businessSlug, customFields, descripti
           </div>
         ) : null}
         <div className="field">
-          <label htmlFor="photos">Project photos</label>
+          <label htmlFor="photos">{terminology.job_singular} photos</label>
           <input
             accept="image/jpeg,image/png,image/webp,image/gif"
             id="photos"

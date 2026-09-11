@@ -1,4 +1,4 @@
-import type { BusinessDashboardWidget, BusinessPipelineStatus, BusinessServiceType, DashboardWidgetKey, JobStatus } from "@/lib/job-tracker/types";
+import type { BusinessDashboardWidget, BusinessPipelineStatus, BusinessServiceType, BusinessTerminology, DashboardWidgetKey, JobStatus } from "@/lib/job-tracker/types";
 
 export const defaultServiceTypes = [
   { key: "garage_floor", label: "Garage floor" },
@@ -19,15 +19,15 @@ export const defaultPipelineStatuses: Array<{ key: JobStatus; label: string; sem
 ];
 
 export const dashboardWidgetRegistry: Record<DashboardWidgetKey, { defaultLabel: string; helper: string; zone: "primary" | "secondary" | "section" }> = {
-  active_job_board: { defaultLabel: "Active job board", helper: "Job table section", zone: "section" },
-  avg_job: { defaultLabel: "Avg. Job", helper: "Across all jobs", zone: "secondary" },
+  active_job_board: { defaultLabel: "Active job board", helper: "Work table section", zone: "section" },
+  avg_job: { defaultLabel: "Avg. Job", helper: "Across all work", zone: "secondary" },
   completed: { defaultLabel: "Completed", helper: "Booked revenue", zone: "secondary" },
-  in_progress: { defaultLabel: "In Progress", helper: "Active installs", zone: "primary" },
+  in_progress: { defaultLabel: "In Progress", helper: "Active work", zone: "primary" },
   needs_attention: { defaultLabel: "Needs Attention", helper: "Priority follow-up section", zone: "section" },
   new_leads: { defaultLabel: "New Leads", helper: "Needs first response", zone: "primary" },
   open_pipeline: { defaultLabel: "Open Pipeline", helper: "Not completed", zone: "primary" },
   quoted: { defaultLabel: "Quoted", helper: "Awaiting answer", zone: "secondary" },
-  scheduled: { defaultLabel: "Scheduled", helper: "Confirmed work", zone: "primary" },
+  scheduled: { defaultLabel: "Scheduled", helper: "Scheduled", zone: "primary" },
   upcoming: { defaultLabel: "Upcoming", helper: "Scheduled work section", zone: "section" },
 };
 
@@ -43,6 +43,19 @@ export const defaultDashboardWidgets: DashboardWidgetKey[] = [
   "active_job_board",
   "upcoming",
 ];
+
+export const defaultTerminology = {
+  active_board_title: "Active job board",
+  customer_plural: "Customers",
+  customer_singular: "Customer",
+  job_plural: "Jobs",
+  job_singular: "Job",
+  new_customer_button_label: "New Customer",
+  new_job_button_label: "New Job",
+  quote_plural: "Quotes",
+  quote_singular: "Quote",
+  upcoming_title: "Upcoming",
+};
 
 export function normalizeServiceTypes(rows: BusinessServiceType[] = []) {
   const enabledRows = rows
@@ -118,4 +131,30 @@ export function normalizeDashboardWidgets(rows: BusinessDashboardWidget[] = []) 
       };
     })
     .sort((a, b) => a.sort_order - b.sort_order);
+}
+
+export type Terminology = typeof defaultTerminology;
+
+export function normalizeTerminology(row?: Partial<BusinessTerminology> | null): Terminology {
+  const cleanTerm = (value: string | null | undefined, fallback: string) => {
+    const cleaned = String(value ?? "").trim().slice(0, 40);
+    return cleaned || fallback;
+  };
+
+  return {
+    active_board_title: cleanTerm(row?.active_board_title, defaultTerminology.active_board_title),
+    customer_plural: cleanTerm(row?.customer_plural, defaultTerminology.customer_plural),
+    customer_singular: cleanTerm(row?.customer_singular, defaultTerminology.customer_singular),
+    job_plural: cleanTerm(row?.job_plural, defaultTerminology.job_plural),
+    job_singular: cleanTerm(row?.job_singular, defaultTerminology.job_singular),
+    new_customer_button_label: cleanTerm(row?.new_customer_button_label, defaultTerminology.new_customer_button_label),
+    new_job_button_label: cleanTerm(row?.new_job_button_label, defaultTerminology.new_job_button_label),
+    quote_plural: cleanTerm(row?.quote_plural, defaultTerminology.quote_plural),
+    quote_singular: cleanTerm(row?.quote_singular, defaultTerminology.quote_singular),
+    upcoming_title: cleanTerm(row?.upcoming_title, defaultTerminology.upcoming_title),
+  };
+}
+
+export function lowerTerm(value: string) {
+  return value.trim().toLowerCase();
 }

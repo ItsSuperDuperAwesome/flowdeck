@@ -1,4 +1,5 @@
 import { createClient } from "@supabase/supabase-js";
+import { lowerTerm, normalizeTerminology } from "@/lib/job-tracker/config";
 import { acceptPublicQuote, declinePublicQuote, sendPublicQuoteMessage } from "./actions";
 import { getSupabaseConfig } from "@/lib/supabase/env";
 import Link from "next/link";
@@ -19,6 +20,7 @@ type PublicQuoteData = {
   valid_until?: string | null;
   expired?: boolean;
   messages?: PublicQuoteMessage[];
+  terminology?: Record<string, string | null>;
 };
 
 type PublicQuoteMessage = {
@@ -85,22 +87,23 @@ export default async function PublicQuotePage({
   const canRespond = quote.quote_status === "sent";
   const canAccept = canRespond && !quote.expired;
   const statusLabel = quoteStatusLabels[quote.quote_status];
+  const terminology = normalizeTerminology(quote.terminology);
 
   return (
     <main className="public-page">
       <div className="public-shell">
         <section className="public-form-card quote-public-card">
           <div className="public-form-heading">
-            <p className="eyebrow">{quote.business_name ?? "Quote"}</p>
-            <h1>{quote.job_title ?? "Project quote"}</h1>
-            <p>Review the quote below. You can accept it, decline it, or send a question back to the business.</p>
+            <p className="eyebrow">{quote.business_name ?? terminology.quote_singular}</p>
+            <h1>{quote.job_title ?? `${terminology.job_singular} ${lowerTerm(terminology.quote_singular)}`}</h1>
+            <p>Review the {lowerTerm(terminology.quote_singular)} below. You can accept it, decline it, or send a question back to the business.</p>
           </div>
 
           {query.message ? <p className="form-message">{query.message}</p> : null}
 
           <div className="public-quote-summary">
             <div>
-              <span>Quote amount</span>
+              <span>{terminology.quote_singular} amount</span>
               <strong>{money(quote.quote_amount_cents ?? 0)}</strong>
             </div>
             <div>
@@ -113,9 +116,9 @@ export default async function PublicQuotePage({
             </div>
           </div>
 
-          {quote.expired ? <p className="quote-expired">This quote is expired. You can still send a question, but it can no longer be accepted.</p> : null}
-          {isAccepted ? <p className="quote-accepted">This quote was accepted on {dateLabel(quote.accepted_at)}.</p> : null}
-          {isDeclined ? <p className="quote-declined">This quote was declined on {dateLabel(quote.declined_at)}.</p> : null}
+          {quote.expired ? <p className="quote-expired">This {lowerTerm(terminology.quote_singular)} is expired. You can still send a question, but it can no longer be accepted.</p> : null}
+          {isAccepted ? <p className="quote-accepted">This {lowerTerm(terminology.quote_singular)} was accepted on {dateLabel(quote.accepted_at)}.</p> : null}
+          {isDeclined ? <p className="quote-declined">This {lowerTerm(terminology.quote_singular)} was declined on {dateLabel(quote.declined_at)}.</p> : null}
 
           <section className="public-quote-scope">
             <h2>Scope</h2>
@@ -126,7 +129,7 @@ export default async function PublicQuotePage({
             <form action={acceptPublicQuote}>
               <input type="hidden" name="token" value={token} />
               <button className="button" disabled={!canAccept} type="submit">
-                Accept Quote
+                Accept {terminology.quote_singular}
               </button>
             </form>
             <form action={declinePublicQuote}>
@@ -141,7 +144,7 @@ export default async function PublicQuotePage({
             <input type="hidden" name="token" value={token} />
             <label>
               Ask a question
-              <textarea name="customerMessage" maxLength={1000} placeholder="Type your question about the quote." rows={4} required />
+              <textarea name="customerMessage" maxLength={1000} placeholder={`Type your question about the ${lowerTerm(terminology.quote_singular)}.`} rows={4} required />
             </label>
             <button className="button button-secondary" type="submit">
               Send Message

@@ -21,6 +21,7 @@ import {
   updateJobStatus,
   updatePipelineStatusConfig,
   updateServiceType,
+  updateTerminology,
 } from "@/app/dashboard/actions";
 import {
   dashboardWidgetRegistry,
@@ -28,13 +29,17 @@ import {
   normalizeDashboardWidgets,
   normalizePipelineStatuses,
   normalizeServiceTypes,
+  normalizeTerminology,
   pipelineLabelMap,
+  lowerTerm,
+  type Terminology,
 } from "@/lib/job-tracker/config";
 import type {
   Business,
   BusinessDashboardWidget,
   BusinessPipelineStatus,
   BusinessServiceType,
+  BusinessTerminology,
   Customer,
   CustomerSummary,
   DashboardWidgetKey,
@@ -78,6 +83,7 @@ type DashboardClientProps = {
   pipelineStatuses: BusinessPipelineStatus[];
   quoteMessages: (QuoteMessage & { job: Job | null })[];
   serviceTypes: BusinessServiceType[];
+  terminology: BusinessTerminology | null;
   userEmail: string;
 };
 
@@ -225,11 +231,14 @@ function daysSince(value: string) {
   return Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 86_400_000));
 }
 
-function buildAttentionItems(jobs: Job[], quoteMessages: (QuoteMessage & { job: Job | null })[]): AttentionItem[] {
+function buildAttentionItems(jobs: Job[], quoteMessages: (QuoteMessage & { job: Job | null })[], terminology: Terminology): AttentionItem[] {
   const now = Date.now();
   const staleQuoteMs = 3 * 86_400_000;
   const soonMs = 7 * 86_400_000;
   const items: AttentionItem[] = [];
+  const customerTerm = lowerTerm(terminology.customer_singular);
+  const jobTerm = lowerTerm(terminology.job_singular);
+  const quoteTerm = lowerTerm(terminology.quote_singular);
 
   const unresolvedByQuote = new Map<string, QuoteMessage & { job: Job | null }>();
   quoteMessages.forEach((quoteMessage) => {
@@ -244,12 +253,12 @@ function buildAttentionItems(jobs: Job[], quoteMessages: (QuoteMessage & { job: 
     }
 
     items.push({
-      action: "Review the question and follow up with the customer.",
+      action: `Review the question and follow up with the ${customerTerm}.`,
       age: ageLabel(quoteMessage.created_at),
       id: `${quoteMessage.id}-quote-message`,
       job: quoteMessage.job,
       priority: 0,
-      problem: "Customer has a question about a quote",
+      problem: `${terminology.customer_singular} has a question about a ${quoteTerm}`,
       quoteMessage,
       quickAction: "resolve_quote_message",
     });
@@ -262,7 +271,7 @@ function buildAttentionItems(jobs: Job[], quoteMessages: (QuoteMessage & { job: 
 
     if (job.status === "lead" && !job.first_contact_at) {
       items.push({
-        action: "Contact the customer and mark the lead contacted.",
+        action: `Contact the ${customerTerm} and mark the lead contacted.`,
         age: ageLabel(job.created_at),
         id: `${job.id}-new-lead`,
         job,
@@ -290,18 +299,18 @@ function buildAttentionItems(jobs: Job[], quoteMessages: (QuoteMessage & { job: 
       now - new Date(job.quote_sent_at).getTime() >= staleQuoteMs
     ) {
       items.push({
-        action: "Check in on the quote or set a follow-up.",
-        age: `${daysSince(job.quote_sent_at)} days since quote`,
+        action: `Check in on the ${quoteTerm} or set a follow-up.`,
+        age: `${daysSince(job.quote_sent_at)} days since ${quoteTerm}`,
         id: `${job.id}-stale-quote`,
         job,
         priority: 2,
-        problem: "Quote is getting stale",
+        problem: `${terminology.quote_singular} is getting stale`,
       });
     }
 
     if ((job.status === "contacted" || job.status === "quoted") && !job.scheduled_start) {
       items.push({
-        action: "Schedule the job or mark it lost.",
+        action: `Schedule the ${jobTerm} or mark it lost.`,
         age: ageLabel(job.updated_at),
         id: `${job.id}-unscheduled`,
         job,
@@ -317,7 +326,7 @@ function buildAttentionItems(jobs: Job[], quoteMessages: (QuoteMessage & { job: 
         id: `${job.id}-scheduled-no-date`,
         job,
         priority: 0,
-        problem: "Scheduled job has no start date",
+        problem: `Scheduled ${jobTerm} has no start date`,
       });
     }
 
@@ -334,7 +343,7 @@ function buildAttentionItems(jobs: Job[], quoteMessages: (QuoteMessage & { job: 
         id: `${job.id}-missing-address`,
         job,
         priority: 3,
-        problem: "Upcoming job is missing an address",
+        problem: `Upcoming ${jobTerm} is missing an address`,
       });
     }
   });
@@ -460,6 +469,7 @@ export function DashboardClient({
   pipelineStatuses,
   quoteMessages,
   serviceTypes,
+  terminology,
   userEmail,
 }: DashboardClientProps) {
   const [activeView, setActiveView] = useState<View>(initialView ?? "Overview");
@@ -548,12 +558,13 @@ export function DashboardClient({
     .filter((job) => job.scheduled_start && operationalStatuses.includes(job.status))
     .sort((a, b) => String(a.scheduled_start).localeCompare(String(b.scheduled_start)))
     .slice(0, 5);
-  const needsAttention = useMemo(() => buildAttentionItems(jobs, quoteMessages), [jobs, quoteMessages]);
   const configuredServices = useMemo(() => normalizeServiceTypes(serviceTypes), [serviceTypes]);
   const configuredPipelineStatuses = useMemo(() => normalizePipelineStatuses(pipelineStatuses), [pipelineStatuses]);
   const enabledStatuses = useMemo(() => enabledPipelineStatuses(pipelineStatuses), [pipelineStatuses]);
   const configuredStatusLabels = useMemo(() => pipelineLabelMap(pipelineStatuses), [pipelineStatuses]);
   const configuredDashboardWidgets = useMemo(() => normalizeDashboardWidgets(dashboardWidgets), [dashboardWidgets]);
+  const terms = useMemo(() => normalizeTerminology(terminology), [terminology]);
+  const needsAttention = useMemo(() => buildAttentionItems(jobs, quoteMessages, terms), [jobs, quoteMessages, terms]);
 
   const showSearch = activeView === "Overview" || activeView === "Pipeline" || activeView === "Jobs" || activeView === "Customers";
 
@@ -590,7 +601,7 @@ export function DashboardClient({
                 type="button"
               >
                 <span aria-hidden="true">{navIcons[item]}</span>
-                {item}
+                {item === "Jobs" ? terms.job_plural : item === "Customers" ? terms.customer_plural : item}
               </button>
             ))}
           </nav>
@@ -598,7 +609,7 @@ export function DashboardClient({
           <div className="sidebar-footer">
             <p>Today</p>
             <strong>{counts.scheduled + counts.in_progress}</strong>
-            <span>{pluralize(counts.scheduled + counts.in_progress, "active job")}</span>
+            <span>{pluralize(counts.scheduled + counts.in_progress, `active ${lowerTerm(terms.job_singular)}`, `active ${lowerTerm(terms.job_plural)}`)}</span>
           </div>
 
           <form className="profile-card" action={logout}>
@@ -615,10 +626,10 @@ export function DashboardClient({
         <section className="dashboard-main">
           <header className="dashboard-header">
             <div>
-              <p className="eyebrow">{activeView}</p>
-              <h1>{viewTitle(activeView)}</h1>
+              <p className="eyebrow">{viewLabel(activeView, terms)}</p>
+              <h1>{viewTitle(activeView, terms)}</h1>
               <p className="muted">
-                {todayLabel()} | {pluralize(jobs.length, "job")} | {pluralize(customers.length, "customer")}
+                {todayLabel()} | {pluralize(jobs.length, lowerTerm(terms.job_singular), lowerTerm(terms.job_plural))} | {pluralize(customers.length, lowerTerm(terms.customer_singular), lowerTerm(terms.customer_plural))}
               </p>
             </div>
             <div className="header-actions">
@@ -628,9 +639,9 @@ export function DashboardClient({
                     <SearchIcon />
                   </span>
                   <input
-                    aria-label="Search jobs and customers"
+                    aria-label={`Search ${lowerTerm(terms.job_plural)} and ${lowerTerm(terms.customer_plural)}`}
                     onChange={(event) => setQuery(event.target.value)}
-                    placeholder={activeView === "Customers" ? "Search customers" : "Search jobs"}
+                    placeholder={activeView === "Customers" ? `Search ${lowerTerm(terms.customer_plural)}` : `Search ${lowerTerm(terms.job_plural)}`}
                     value={query}
                   />
                 </label>
@@ -638,13 +649,13 @@ export function DashboardClient({
               {activeView !== "Settings" && (activeView === "Customers" || customers.length === 0) ? (
                 <button className="button" onClick={() => setCustomerModal("new")} type="button">
                   <span aria-hidden="true">+</span>
-                  New Customer
+                  {terms.new_customer_button_label}
                 </button>
               ) : null}
               {activeView !== "Settings" && activeView !== "Customers" && customers.length > 0 ? (
                 <button className="button" onClick={() => setJobModal({})} type="button">
                   <span aria-hidden="true">+</span>
-                  New Job
+                  {terms.new_job_button_label}
                 </button>
               ) : null}
             </div>
@@ -666,6 +677,7 @@ export function DashboardClient({
               totalPipeline={totalPipeline}
               upcomingJobs={upcomingJobs}
               averageJobValue={averageJobValue}
+              terminology={terms}
             />
           ) : null}
 
@@ -678,15 +690,16 @@ export function DashboardClient({
               setStatusFilter={setStatusFilter}
               sort={sort}
               statusFilter={statusFilter}
+              terminology={terms}
             />
           ) : null}
 
           {activeView === "Pipeline" ? (
-            <PipelineView jobs={filteredJobs} pipelineStatuses={enabledStatuses} statusLabels={configuredStatusLabels} totalJobs={jobs.length} />
+            <PipelineView jobs={filteredJobs} pipelineStatuses={enabledStatuses} statusLabels={configuredStatusLabels} terminology={terms} totalJobs={jobs.length} />
           ) : null}
 
           {activeView === "Customers" ? (
-            <CustomersView customers={visibleCustomers} hasCustomers={customers.length > 0} onCreate={() => setCustomerModal("new")} />
+            <CustomersView customers={visibleCustomers} hasCustomers={customers.length > 0} onCreate={() => setCustomerModal("new")} terminology={terms} />
           ) : null}
 
           {activeView === "Calendar" ? (
@@ -710,6 +723,7 @@ export function DashboardClient({
               statusLabels={configuredStatusLabels}
               statusOrder={configuredPipelineStatuses.map((status) => status.semantic_type)}
               totalPipeline={totalPipeline}
+              terminology={terms}
             />
           ) : null}
 
@@ -720,6 +734,7 @@ export function DashboardClient({
               intakeFields={intakeFields}
               pipelineStatuses={configuredPipelineStatuses}
               serviceTypes={serviceTypes.length ? serviceTypes : configuredServices}
+              terminology={terms}
             />
           ) : null}
         </section>
@@ -735,6 +750,7 @@ export function DashboardClient({
           serviceTypes={configuredServices}
           pipelineStatuses={enabledStatuses}
           statusLabels={configuredStatusLabels}
+          terminology={terms}
         />
       ) : null}
 
@@ -743,6 +759,7 @@ export function DashboardClient({
           businessId={business.id}
           customer={customerModal === "new" ? null : customerModal}
           onClose={() => setCustomerModal(null)}
+          terminology={terms}
         />
       ) : null}
     </>
@@ -760,6 +777,7 @@ function OverviewView({
   onCreateJob,
   onViewJobs,
   pipelineStatuses,
+  terminology,
   totalPipeline,
   upcomingJobs,
 }: {
@@ -773,6 +791,7 @@ function OverviewView({
   onCreateJob: () => void;
   onViewJobs: () => void;
   pipelineStatuses: BusinessPipelineStatus[];
+  terminology: Terminology;
   totalPipeline: number;
   upcomingJobs: Job[];
 }) {
@@ -785,18 +804,19 @@ function OverviewView({
         completedRevenue={completedRevenue}
         counts={counts}
         dashboardWidgets={dashboardWidgets}
+        terminology={terminology}
         totalPipeline={totalPipeline}
       />
-      {widgetEnabled("needs_attention") ? <NeedsAttentionPanel items={needsAttention} onViewJobs={onViewJobs} /> : null}
+      {widgetEnabled("needs_attention") ? <NeedsAttentionPanel items={needsAttention} onViewJobs={onViewJobs} terminology={terminology} /> : null}
       <section className="content-grid">
-        {widgetEnabled("active_job_board") ? <JobsPanel jobs={jobs.slice(0, 6)} pipelineStatuses={pipelineStatuses} title="Active job board" /> : null}
-        {widgetEnabled("upcoming") ? <SideSummary activities={activities} onCreateJob={onCreateJob} upcomingJobs={upcomingJobs} /> : null}
+        {widgetEnabled("active_job_board") ? <JobsPanel jobs={jobs.slice(0, 6)} pipelineStatuses={pipelineStatuses} terminology={terminology} title={terminology.active_board_title} /> : null}
+        {widgetEnabled("upcoming") ? <SideSummary activities={activities} onCreateJob={onCreateJob} terminology={terminology} upcomingJobs={upcomingJobs} /> : null}
       </section>
     </>
   );
 }
 
-function NeedsAttentionPanel({ items, onViewJobs }: { items: AttentionItem[]; onViewJobs: () => void }) {
+function NeedsAttentionPanel({ items, onViewJobs, terminology }: { items: AttentionItem[]; onViewJobs: () => void; terminology: Terminology }) {
   const visibleItems = items.slice(0, 4);
   const hiddenCount = Math.max(items.length - visibleItems.length, 0);
   const severityCounts = items.reduce(
@@ -837,7 +857,7 @@ function NeedsAttentionPanel({ items, onViewJobs }: { items: AttentionItem[]; on
                   {attentionLabel(severity)}
                 </span>
                 <div>
-                  <span>{item.job.customer?.name ?? "Unknown customer"}</span>
+                  <span>{item.job.customer?.name ?? `Unknown ${lowerTerm(terminology.customer_singular)}`}</span>
                   <strong>{item.job.title}</strong>
                 </div>
                 <p>{item.problem}</p>
@@ -873,7 +893,7 @@ function NeedsAttentionPanel({ items, onViewJobs }: { items: AttentionItem[]; on
             <div className="attention-footer">
               <span>{pluralize(hiddenCount, "more item")} needs follow-up.</span>
               <button className="link-button" onClick={onViewJobs} type="button">
-                View all jobs
+                View all {lowerTerm(terminology.job_plural)}
               </button>
             </div>
           ) : null}
@@ -901,6 +921,7 @@ function JobsView({
   setStatusFilter,
   sort,
   statusFilter,
+  terminology,
 }: {
   filteredJobs: Job[];
   jobs: Job[];
@@ -909,6 +930,7 @@ function JobsView({
   setStatusFilter: (value: "all" | JobStatus) => void;
   sort: string;
   statusFilter: "all" | JobStatus;
+  terminology: Terminology;
 }) {
   return (
     <JobsPanel
@@ -919,7 +941,8 @@ function JobsView({
       setStatusFilter={setStatusFilter}
       sort={sort}
       statusFilter={statusFilter}
-      title="Jobs"
+      terminology={terminology}
+      title={terminology.job_plural}
       totalJobs={jobs.length}
     />
   );
@@ -929,11 +952,13 @@ function PipelineView({
   jobs,
   pipelineStatuses,
   statusLabels,
+  terminology,
   totalJobs,
 }: {
   jobs: Job[];
   pipelineStatuses: BusinessPipelineStatus[];
   statusLabels: Record<JobStatus, string>;
+  terminology: Terminology;
   totalJobs: number;
 }) {
   const groupedJobs = pipelineStatuses.map((statusConfig) => ({
@@ -946,13 +971,13 @@ function PipelineView({
       <div className="panel-heading">
         <div>
           <h2>Pipeline</h2>
-          <p className="muted">Move real jobs from first contact through completion without leaving the board.</p>
+          <p className="muted">Move real {lowerTerm(terminology.job_plural)} from first contact through completion without leaving the board.</p>
         </div>
-        <span className="panel-count">{pluralize(jobs.length, "visible job")}</span>
+        <span className="panel-count">{pluralize(jobs.length, `visible ${lowerTerm(terminology.job_singular)}`, `visible ${lowerTerm(terminology.job_plural)}`)}</span>
       </div>
 
       {totalJobs ? (
-        <div className="pipeline-board" aria-label="Job pipeline by status">
+        <div className="pipeline-board" aria-label={`${terminology.job_singular} pipeline by status`}>
           {groupedJobs.map(({ status, jobs: columnJobs }) => (
             <section className="pipeline-column" key={status}>
               <div className="pipeline-column-header">
@@ -971,8 +996,8 @@ function PipelineView({
         </div>
       ) : (
         <EmptyState
-          description="Create your first job and it will appear here as a pipeline card."
-          title="No jobs in the pipeline yet"
+          description={`Create your first ${lowerTerm(terminology.job_singular)} and it will appear here as a pipeline card.`}
+          title={`No ${lowerTerm(terminology.job_plural)} in the pipeline yet`}
         />
       )}
     </section>
@@ -1039,6 +1064,7 @@ function JobsPanel({
   setStatusFilter,
   sort,
   statusFilter,
+  terminology = normalizeTerminology(),
   title,
   totalJobs,
 }: {
@@ -1049,6 +1075,7 @@ function JobsPanel({
   setStatusFilter?: (value: "all" | JobStatus) => void;
   sort?: string;
   statusFilter?: "all" | JobStatus;
+  terminology?: Terminology;
   title: string;
   totalJobs?: number;
 }) {
@@ -1060,7 +1087,7 @@ function JobsPanel({
       <div className="panel-heading">
         <div>
           <h2>{title}</h2>
-          <p className="muted">Track new leads, estimates, scheduled work, active installs, and completed jobs.</p>
+          <p className="muted">Track new leads, {lowerTerm(terminology.quote_plural)}, scheduled work, active work, and completed work.</p>
         </div>
         {setStatusFilter && setSort ? (
           <div className="table-controls">
@@ -1079,8 +1106,8 @@ function JobsPanel({
             <select aria-label="Sort jobs" onChange={(event) => setSort(event.target.value)} value={sort}>
               <option value="scheduled">Scheduled date</option>
               <option value="updated">Last updated</option>
-              <option value="value">Job value</option>
-              <option value="customer">Customer</option>
+              <option value="value">{terminology.job_singular} value</option>
+              <option value="customer">{terminology.customer_singular}</option>
             </select>
           </div>
         ) : null}
@@ -1091,7 +1118,7 @@ function JobsPanel({
           <table className="jobs-table operational-table">
             <thead>
               <tr>
-                <th>Job</th>
+                <th>{terminology.job_singular}</th>
                 <th>Status</th>
                 <th>Scheduled</th>
                 <th>Value</th>
@@ -1164,9 +1191,9 @@ function JobsPanel({
           description={
             totalJobs
               ? "Try a different search, status filter, or sort."
-              : "Create a customer and job to start building an operating history."
+              : `Create a ${lowerTerm(terminology.customer_singular)} and ${lowerTerm(terminology.job_singular)} to start building an operating history.`
           }
-          title={totalJobs ? "No matching jobs" : "No jobs yet"}
+          title={totalJobs ? `No matching ${lowerTerm(terminology.job_plural)}` : `No ${lowerTerm(terminology.job_plural)} yet`}
         />
       )}
     </div>
@@ -1178,12 +1205,14 @@ function KpiGrid({
   completedRevenue,
   counts,
   dashboardWidgets,
+  terminology = normalizeTerminology(),
   totalPipeline,
 }: {
   averageJobValue: number;
   completedRevenue: number;
   counts: Record<JobStatus, number>;
   dashboardWidgets?: ReturnType<typeof normalizeDashboardWidgets>;
+  terminology?: Terminology;
   totalPipeline: number;
 }) {
   const widgets = (dashboardWidgets ?? normalizeDashboardWidgets()).filter((widget) => widget.enabled && widget.zone !== "section");
@@ -1215,7 +1244,7 @@ function KpiGrid({
   const secondary = widgets.filter((widget) => widget.zone === "secondary");
 
   return (
-    <section className="kpi-stack" aria-label="Job metrics">
+    <section className="kpi-stack" aria-label={`${dashboardWidgets ? "Workspace" : terminology.job_singular} metrics`}>
       {primary.length ? (
         <div className="kpi-grid kpi-grid-primary">
           {primary.map((widget) => (
@@ -1223,7 +1252,7 @@ function KpiGrid({
               helper={widget.widget_key === "completed" ? money(completedRevenue) : widget.helper}
               icon={icons[widget.widget_key]}
               key={widget.widget_key}
-              label={widget.label}
+              label={widgetLabel(widget, terminology)}
               priority="primary"
               value={values[widget.widget_key]}
             />
@@ -1237,7 +1266,7 @@ function KpiGrid({
               helper={widget.widget_key === "completed" ? money(completedRevenue) : widget.helper}
               icon={icons[widget.widget_key]}
               key={widget.widget_key}
-              label={widget.label}
+              label={widgetLabel(widget, terminology)}
               value={values[widget.widget_key]}
             />
           ))}
@@ -1247,19 +1276,33 @@ function KpiGrid({
   );
 }
 
+function widgetLabel(widget: ReturnType<typeof normalizeDashboardWidgets>[number], terminology: Terminology) {
+  if (widget.label_override) {
+    return widget.label_override;
+  }
+
+  if (widget.widget_key === "avg_job") {
+    return `Avg. ${terminology.job_singular}`;
+  }
+
+  return widget.label;
+}
+
 function SideSummary({
   activities,
   onCreateJob,
+  terminology,
   upcomingJobs,
 }: {
   activities: JobActivity[];
   onCreateJob: () => void;
+  terminology: Terminology;
   upcomingJobs: Job[];
 }) {
   return (
     <aside className="data-panel side-panel">
       <div className="panel-heading compact">
-        <h2>Upcoming</h2>
+        <h2>{terminology.upcoming_title}</h2>
       </div>
       {upcomingJobs.length ? (
         <ul className="upcoming-list">
@@ -1267,7 +1310,7 @@ function SideSummary({
             <li key={job.id}>
               <span>{dateLabel(job.scheduled_start)} at {timeLabel(job.scheduled_start)}</span>
               <Link href={`/jobs/${job.id}`}>
-                <strong>{job.customer?.name ?? "Customer"}</strong>
+                <strong>{job.customer?.name ?? terminology.customer_singular}</strong>
               </Link>
               <p>{job.title}</p>
             </li>
@@ -1277,7 +1320,7 @@ function SideSummary({
         <div className="mini-empty">
           <p className="muted">Confirmed scheduled jobs will appear here.</p>
           <button className="link-button" onClick={onCreateJob} type="button">
-            Schedule a job
+            Schedule a {lowerTerm(terminology.job_singular)}
           </button>
         </div>
       )}
@@ -1288,12 +1331,12 @@ function SideSummary({
           {activities.length ? (
             activities.slice(0, 6).map((activity) => (
               <p key={activity.id}>
-                {activity.job ? <Link href={`/jobs/${activity.job_id}`}>{activity.job.title}</Link> : "Job"}
-                <span> {activity.message}</span>
+                {activity.job ? <Link href={`/jobs/${activity.job_id}`}>{activity.job.title}</Link> : terminology.job_singular}
+                <span> {terminologyActivityMessage(activity.message, terminology)}</span>
               </p>
             ))
           ) : (
-            <p className="muted">Job updates will appear here as work moves forward.</p>
+            <p className="muted">{terminology.job_singular} updates will appear here as work moves forward.</p>
           )}
         </div>
       </div>
@@ -1305,10 +1348,12 @@ function CustomersView({
   customers,
   hasCustomers,
   onCreate,
+  terminology,
 }: {
   customers: CustomerSummary[];
   hasCustomers: boolean;
   onCreate: () => void;
+  terminology: Terminology;
 }) {
   const router = useRouter();
 
@@ -1316,8 +1361,8 @@ function CustomersView({
     <section className="data-panel full-width customers-panel">
       <div className="panel-heading">
         <div>
-          <h2>Customers</h2>
-          <p className="muted">Manage customer records, contact details, and job history.</p>
+          <h2>{terminology.customer_plural}</h2>
+          <p className="muted">Manage {lowerTerm(terminology.customer_singular)} records, contact details, and {lowerTerm(terminology.job_singular)} history.</p>
         </div>
       </div>
       {customers.length ? (
@@ -1325,10 +1370,10 @@ function CustomersView({
           <table className="jobs-table customers-table">
             <thead>
               <tr>
-                <th>Customer</th>
+                <th>{terminology.customer_singular}</th>
                 <th>Contact</th>
                 <th>Work</th>
-                <th>Last job</th>
+                <th>Last {lowerTerm(terminology.job_singular)}</th>
                 <th aria-label="Actions" />
               </tr>
             </thead>
@@ -1356,7 +1401,7 @@ function CustomersView({
                     <div className="customer-stat-strip">
                       <span>
                         <strong>{customer.job_count}</strong>
-                        {customer.job_count === 1 ? "job" : "jobs"}
+                        {customer.job_count === 1 ? lowerTerm(terminology.job_singular) : lowerTerm(terminology.job_plural)}
                       </span>
                       <span>
                         <strong>{money(customer.lifetime_value_cents)}</strong>
@@ -1375,10 +1420,10 @@ function CustomersView({
         </div>
       ) : (
         <EmptyState
-          actionLabel="New Customer"
-          description={hasCustomers ? "No customers match that search." : "Create customer records before or while adding jobs."}
+          actionLabel={terminology.new_customer_button_label}
+          description={hasCustomers ? `No ${lowerTerm(terminology.customer_plural)} match that search.` : `Create ${lowerTerm(terminology.customer_singular)} records before or while adding ${lowerTerm(terminology.job_plural)}.`}
           onAction={onCreate}
-          title={hasCustomers ? "No matching customers" : "No customers yet"}
+          title={hasCustomers ? `No matching ${lowerTerm(terminology.customer_plural)}` : `No ${lowerTerm(terminology.customer_plural)} yet`}
         />
       )}
     </section>
@@ -1566,6 +1611,7 @@ function AnalyticsView({
   jobs,
   statusLabels,
   statusOrder,
+  terminology,
   totalPipeline,
 }: {
   averageJobValue: number;
@@ -1574,6 +1620,7 @@ function AnalyticsView({
   jobs: Job[];
   statusLabels: Record<JobStatus, string>;
   statusOrder: JobStatus[];
+  terminology: Terminology;
   totalPipeline: number;
 }) {
   const maxCount = Math.max(...Object.values(counts), 1);
@@ -1585,6 +1632,7 @@ function AnalyticsView({
         averageJobValue={averageJobValue}
         completedRevenue={completedRevenue}
         counts={counts}
+        terminology={terminology}
         totalPipeline={totalPipeline}
       />
       <section className="data-panel full-width analytics-panel">
@@ -1612,7 +1660,7 @@ function AnalyticsView({
       <section className="data-panel full-width analytics-panel">
         <div className="panel-heading compact">
           <h2>Source performance</h2>
-          <p className="muted">Lead sources, follow-through, and booked revenue from real job data.</p>
+          <p className="muted">Lead sources, follow-through, and booked revenue from real {lowerTerm(terminology.job_singular)} data.</p>
         </div>
         {sourceRows.length ? (
           <div className="jobs-table-wrap">
@@ -1678,12 +1726,14 @@ function SettingsView({
   intakeFields,
   pipelineStatuses,
   serviceTypes,
+  terminology,
 }: {
   business: Business;
   dashboardWidgets: ReturnType<typeof normalizeDashboardWidgets>;
   intakeFields: IntakeField[];
   pipelineStatuses: BusinessPipelineStatus[];
   serviceTypes: BusinessServiceType[];
+  terminology: Terminology;
 }) {
   const intakePath = business.slug ? `/intake/${business.slug}` : "";
   const enabledFieldCount = intakeFields.filter((field) => field.enabled).length;
@@ -1712,6 +1762,67 @@ function SettingsView({
             <input id="businessName" name="name" defaultValue={business.name} required />
           </div>
           <SubmitButton>Save settings</SubmitButton>
+        </form>
+      </section>
+
+      <section className="data-panel settings-panel">
+        <div className="panel-heading compact">
+          <h2>Terminology</h2>
+          <p className="muted">Customize the main business nouns customers and team members see.</p>
+        </div>
+        <form className="settings-form" action={updateTerminology}>
+          <input type="hidden" name="businessId" value={business.id} />
+          <div className="split-fields">
+            <div className="field">
+              <label htmlFor="term-job-singular">Work item singular</label>
+              <input id="term-job-singular" name="jobSingular" defaultValue={terminology.job_singular} maxLength={40} required />
+            </div>
+            <div className="field">
+              <label htmlFor="term-job-plural">Work item plural</label>
+              <input id="term-job-plural" name="jobPlural" defaultValue={terminology.job_plural} maxLength={40} required />
+            </div>
+          </div>
+          <div className="split-fields">
+            <div className="field">
+              <label htmlFor="term-customer-singular">Contact singular</label>
+              <input id="term-customer-singular" name="customerSingular" defaultValue={terminology.customer_singular} maxLength={40} required />
+            </div>
+            <div className="field">
+              <label htmlFor="term-customer-plural">Contact plural</label>
+              <input id="term-customer-plural" name="customerPlural" defaultValue={terminology.customer_plural} maxLength={40} required />
+            </div>
+          </div>
+          <div className="split-fields">
+            <div className="field">
+              <label htmlFor="term-quote-singular">Pricing document singular</label>
+              <input id="term-quote-singular" name="quoteSingular" defaultValue={terminology.quote_singular} maxLength={40} required />
+            </div>
+            <div className="field">
+              <label htmlFor="term-quote-plural">Pricing document plural</label>
+              <input id="term-quote-plural" name="quotePlural" defaultValue={terminology.quote_plural} maxLength={40} required />
+            </div>
+          </div>
+          <div className="split-fields">
+            <div className="field">
+              <label htmlFor="term-active-board">Overview board title</label>
+              <input id="term-active-board" name="activeBoardTitle" defaultValue={terminology.active_board_title} maxLength={40} />
+            </div>
+            <div className="field">
+              <label htmlFor="term-upcoming">Upcoming section title</label>
+              <input id="term-upcoming" name="upcomingTitle" defaultValue={terminology.upcoming_title} maxLength={40} />
+            </div>
+          </div>
+          <div className="split-fields">
+            <div className="field">
+              <label htmlFor="term-new-job">New work button</label>
+              <input id="term-new-job" name="newJobButtonLabel" defaultValue={terminology.new_job_button_label} maxLength={40} />
+            </div>
+            <div className="field">
+              <label htmlFor="term-new-customer">New contact button</label>
+              <input id="term-new-customer" name="newCustomerButtonLabel" defaultValue={terminology.new_customer_button_label} maxLength={40} />
+            </div>
+          </div>
+          <SubmitButton>Save terminology</SubmitButton>
         </form>
       </section>
 
@@ -2094,18 +2205,20 @@ function CustomerModal({
   businessId,
   customer,
   onClose,
+  terminology,
 }: {
   businessId: string;
   customer: CustomerSummary | null;
   onClose: () => void;
+  terminology: Terminology;
 }) {
   return (
     <div className="modal-backdrop" role="presentation">
       <div className="modal" role="dialog" aria-modal="true" aria-labelledby="customer-modal-title">
         <div className="modal-header">
           <div>
-            <p className="eyebrow">{customer ? "Edit Customer" : "New Customer"}</p>
-            <h2 id="customer-modal-title">{customer ? "Update customer record" : "Create customer record"}</h2>
+            <p className="eyebrow">{customer ? `Edit ${terminology.customer_singular}` : terminology.new_customer_button_label}</p>
+            <h2 id="customer-modal-title">{customer ? `Update ${lowerTerm(terminology.customer_singular)} record` : `Create ${lowerTerm(terminology.customer_singular)} record`}</h2>
           </div>
           <button className="icon-button" onClick={onClose} type="button" aria-label="Close customer form">
             x
@@ -2114,17 +2227,33 @@ function CustomerModal({
         <form className="modal-form" action={customer ? updateCustomer : createCustomer}>
           <input type="hidden" name="businessId" value={businessId} />
           {customer ? <input type="hidden" name="customerId" value={customer.id} /> : null}
-          <CustomerFields customer={customer} />
+          <CustomerFields customer={customer} terminology={terminology} />
           <div className="modal-actions">
             <button className="button button-secondary" onClick={onClose} type="button">
               Cancel
             </button>
-            <SubmitButton>{customer ? "Save customer" : "Create customer"}</SubmitButton>
+            <SubmitButton>{customer ? `Save ${lowerTerm(terminology.customer_singular)}` : `Create ${lowerTerm(terminology.customer_singular)}`}</SubmitButton>
           </div>
         </form>
       </div>
     </div>
   );
+}
+
+function terminologyActivityMessage(message: string, terminology: Terminology) {
+  return message
+    .replace(/\bCustomer\b/g, terminology.customer_singular)
+    .replace(/\bcustomer\b/g, lowerTerm(terminology.customer_singular))
+    .replace(/\bCustomers\b/g, terminology.customer_plural)
+    .replace(/\bcustomers\b/g, lowerTerm(terminology.customer_plural))
+    .replace(/\bQuote\b/g, terminology.quote_singular)
+    .replace(/\bquote\b/g, lowerTerm(terminology.quote_singular))
+    .replace(/\bQuotes\b/g, terminology.quote_plural)
+    .replace(/\bquotes\b/g, lowerTerm(terminology.quote_plural))
+    .replace(/\bJob\b/g, terminology.job_singular)
+    .replace(/\bjob\b/g, lowerTerm(terminology.job_singular))
+    .replace(/\bJobs\b/g, terminology.job_plural)
+    .replace(/\bjobs\b/g, lowerTerm(terminology.job_plural));
 }
 
 function JobModal({
@@ -2136,6 +2265,7 @@ function JobModal({
   scheduledStart,
   serviceTypes,
   statusLabels,
+  terminology,
 }: {
   businessId: string;
   customers: CustomerSummary[];
@@ -2145,6 +2275,7 @@ function JobModal({
   scheduledStart?: Date;
   serviceTypes: BusinessServiceType[];
   statusLabels: Record<JobStatus, string>;
+  terminology: Terminology;
 }) {
   const start = job ? dateTimeValue(job.scheduled_start) : scheduledStart ? dateTimeValue(scheduledStart.toISOString()) : { date: "", time: "" };
   const end = job ? dateTimeValue(job.scheduled_end) : { date: "", time: "" };
@@ -2154,8 +2285,8 @@ function JobModal({
       <div className="modal" role="dialog" aria-modal="true" aria-labelledby="job-modal-title">
         <div className="modal-header">
           <div>
-            <p className="eyebrow">{job ? "Edit Job" : "New Job"}</p>
-            <h2 id="job-modal-title">{job ? "Update job details" : "Add work to the schedule"}</h2>
+            <p className="eyebrow">{job ? `Edit ${terminology.job_singular}` : terminology.new_job_button_label}</p>
+            <h2 id="job-modal-title">{job ? `Update ${lowerTerm(terminology.job_singular)} details` : "Add work to the schedule"}</h2>
           </div>
           <button className="icon-button" onClick={onClose} type="button" aria-label="Close job form">
             x
@@ -2164,12 +2295,12 @@ function JobModal({
         <form className="modal-form" action={job ? updateJob : createJob}>
           <input type="hidden" name="businessId" value={businessId} />
           {job ? <input type="hidden" name="jobId" value={job.id} /> : null}
-          <JobFields customers={customers} end={end} job={job} pipelineStatuses={pipelineStatuses} serviceTypes={serviceTypes} start={start} statusLabels={statusLabels} />
+          <JobFields customers={customers} end={end} job={job} pipelineStatuses={pipelineStatuses} serviceTypes={serviceTypes} start={start} statusLabels={statusLabels} terminology={terminology} />
           <div className="modal-actions">
             <button className="button button-secondary" onClick={onClose} type="button">
               Cancel
             </button>
-            <SubmitButton>{job ? "Save job" : "Create job"}</SubmitButton>
+            <SubmitButton>{job ? `Save ${lowerTerm(terminology.job_singular)}` : `Create ${lowerTerm(terminology.job_singular)}`}</SubmitButton>
           </div>
         </form>
       </div>
@@ -2177,11 +2308,11 @@ function JobModal({
   );
 }
 
-export function CustomerFields({ customer }: { customer: Customer | CustomerSummary | null }) {
+export function CustomerFields({ customer, terminology = normalizeTerminology() }: { customer: Customer | CustomerSummary | null; terminology?: Terminology }) {
   return (
     <>
       <div className="field">
-        <label htmlFor="name">Customer name</label>
+        <label htmlFor="name">{terminology.customer_singular} name</label>
         <input id="name" name="name" defaultValue={customer?.name ?? ""} placeholder="Sarah Mitchell" required />
       </div>
       <div className="split-fields">
@@ -2224,6 +2355,7 @@ export function JobFields({
   serviceTypes = normalizeServiceTypes(),
   start,
   statusLabels = pipelineLabelMap(),
+  terminology = normalizeTerminology(),
 }: {
   customers: CustomerSummary[];
   end: { date: string; time: string };
@@ -2232,16 +2364,17 @@ export function JobFields({
   serviceTypes?: BusinessServiceType[];
   start: { date: string; time: string };
   statusLabels?: Record<JobStatus, string>;
+  terminology?: Terminology;
 }) {
   const enabledStatusOptions = job?.status === "lost" ? pipelineStatuses : pipelineStatuses.filter((status) => status.enabled && status.semantic_type !== "lost");
 
   return (
     <>
       <div className="field">
-        <label htmlFor="customerId">Customer</label>
+        <label htmlFor="customerId">{terminology.customer_singular}</label>
         <select id="customerId" name="customerId" defaultValue={job?.customer_id ?? customers[0]?.id ?? ""} required>
           <option value="" disabled>
-            Select a customer
+            Select a {lowerTerm(terminology.customer_singular)}
           </option>
           {customers.map((customer) => (
             <option key={customer.id} value={customer.id}>
@@ -2251,7 +2384,7 @@ export function JobFields({
         </select>
       </div>
       <div className="field">
-        <label htmlFor="title">Job title</label>
+        <label htmlFor="title">{terminology.job_singular} title</label>
         <input id="title" name="title" defaultValue={job?.title ?? ""} placeholder="Garage floor coating" required />
       </div>
       <div className="field">
@@ -2270,7 +2403,7 @@ export function JobFields({
           </select>
         </div>
         <div className="field">
-          <label htmlFor="price">Job value</label>
+          <label htmlFor="price">{terminology.job_singular} value</label>
           <input id="price" name="price" inputMode="decimal" defaultValue={job ? inputMoney(job.price_cents) : ""} placeholder="3200" />
         </div>
       </div>
@@ -2404,18 +2537,30 @@ function calendarRangeLabel(date: Date, mode: CalendarMode) {
   return `${dateLabel(first.toISOString())} - ${dateLabel(last.toISOString())}`;
 }
 
-function viewTitle(view: View) {
+function viewTitle(view: View, terminology: Terminology) {
   const titles: Record<View, string> = {
     Overview: "Today's work",
     Pipeline: "Pipeline board",
-    Jobs: "Job pipeline",
-    Customers: "Customer list",
+    Jobs: `${terminology.job_singular} pipeline`,
+    Customers: `${terminology.customer_singular} list`,
     Calendar: "Field schedule",
     Analytics: "Performance snapshot",
     Settings: "Workspace settings",
   };
 
   return titles[view];
+}
+
+function viewLabel(view: View, terminology: Terminology) {
+  if (view === "Jobs") {
+    return terminology.job_plural;
+  }
+
+  if (view === "Customers") {
+    return terminology.customer_plural;
+  }
+
+  return view;
 }
 
 function SearchIcon() {

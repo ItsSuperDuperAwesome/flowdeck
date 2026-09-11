@@ -13,8 +13,9 @@ import {
   updateJob,
   updateJobStatus,
 } from "@/app/dashboard/actions";
-import { enabledPipelineStatuses, normalizeServiceTypes, pipelineLabelMap } from "@/lib/job-tracker/config";
+import { enabledPipelineStatuses, normalizeServiceTypes, normalizeTerminology, pipelineLabelMap, lowerTerm, type Terminology } from "@/lib/job-tracker/config";
 import type {
+  BusinessTerminology,
   BusinessPipelineStatus,
   BusinessServiceType,
   Customer,
@@ -232,10 +233,16 @@ export default async function JobDetail({
     .eq("business_id", job.business_id)
     .order("sort_order", { ascending: true })
     .order("created_at", { ascending: true });
+  const { data: terminologyRow } = await supabase
+    .from("business_terminology")
+    .select("id, business_id, job_singular, job_plural, customer_singular, customer_plural, quote_singular, quote_plural, active_board_title, upcoming_title, new_job_button_label, new_customer_button_label, created_at, updated_at")
+    .eq("business_id", job.business_id)
+    .maybeSingle();
   const serviceTypes = normalizeServiceTypes((serviceTypeRows ?? []) as BusinessServiceType[]);
   const pipelineConfig = (pipelineStatusRows ?? []) as BusinessPipelineStatus[];
   const pipelineStatuses = enabledPipelineStatuses(pipelineConfig);
   const statusLabels = pipelineConfig.length ? pipelineLabelMap(pipelineConfig) : defaultStatusLabels;
+  const terminology = normalizeTerminology((terminologyRow ?? null) as BusinessTerminology | null);
 
   const { data: quoteRows } = await supabase
     .from("quotes")
@@ -284,8 +291,8 @@ export default async function JobDetail({
   const serviceAddress = job.job_address || address(job.customer) || "No service address yet";
   const salesItems = [
     { label: "First contact", value: optionalDateLabel(job.first_contact_at) },
-    { label: "Quote status", value: quote ? quoteStatusLabels[quote.status] : job.quote_sent_at ? "Quote sent" : "No quote yet" },
-    { label: "Quote sent", value: optionalDateLabel(quote?.sent_at ?? job.quote_sent_at) },
+    { label: `${terminology.quote_singular} status`, value: quote ? quoteStatusLabels[quote.status] : job.quote_sent_at ? `${terminology.quote_singular} sent` : `No ${lowerTerm(terminology.quote_singular)} yet` },
+    { label: `${terminology.quote_singular} sent`, value: optionalDateLabel(quote?.sent_at ?? job.quote_sent_at) },
     { label: "Won", value: optionalDateLabel(job.won_at) },
     { label: "Next follow-up", value: optionalDateLabel(job.next_follow_up_at) },
     ...(job.completed_at ? [{ label: "Completed", value: optionalDateLabel(job.completed_at) }] : []),
@@ -300,16 +307,16 @@ export default async function JobDetail({
           <Link className="back-link" href="/dashboard">
             Back to dashboard
           </Link>
-          <p className="eyebrow">Job</p>
+          <p className="eyebrow">{terminology.job_singular}</p>
           <h1>{job.title}</h1>
           <p className="muted">
             {job.customer?.name ?? "Unknown customer"} | {statusLabels[job.status]} | {money(job.price_cents)}
           </p>
         </div>
         <div className="detail-header-actions">
-          <PrimaryJobAction job={job} />
+          <PrimaryJobAction job={job} terminology={terminology} />
           <Link className="button button-secondary" href={`/jobs/${job.id}?edit=1#edit-job`}>
-            Edit Job
+            Edit {terminology.job_singular}
           </Link>
         </div>
       </div>
@@ -320,11 +327,11 @@ export default async function JobDetail({
         <section className="detail-top-grid">
           <section className="data-panel">
             <div className="panel-heading compact">
-              <h2>Job Summary</h2>
-              <p className="muted">The key details needed to move this job forward.</p>
+              <h2>{terminology.job_singular} Summary</h2>
+              <p className="muted">The key details needed to move this {lowerTerm(terminology.job_singular)} forward.</p>
             </div>
             <div className="info-grid info-grid-compact">
-              <Info label="Customer" value={job.customer?.name ?? "Unknown customer"} href={job.customer ? `/customers/${job.customer.id}` : undefined} />
+              <Info label={terminology.customer_singular} value={job.customer?.name ?? `Unknown ${lowerTerm(terminology.customer_singular)}`} href={job.customer ? `/customers/${job.customer.id}` : undefined} />
               <Info label="Phone" value={job.customer?.phone ?? "No phone"} href={job.customer?.phone ? `tel:${job.customer.phone}` : undefined} />
               <Info label="Email" value={job.customer?.email ?? "No email"} href={job.customer?.email ? `mailto:${job.customer.email}` : undefined} />
               <Info label="Service address" value={serviceAddress} />
@@ -351,9 +358,9 @@ export default async function JobDetail({
           </section>
         </section>
 
-        <QuotePanel job={job} quote={quote} quoteMessages={quoteMessages} />
+        <QuotePanel job={job} quote={quote} quoteMessages={quoteMessages} terminology={terminology} />
 
-        <JobQuickActions job={job} />
+        <JobQuickActions job={job} terminology={terminology} />
 
         <IntakeResponsesPanel intakeData={job.intake_data} />
 
@@ -373,19 +380,19 @@ export default async function JobDetail({
           </section>
         </section>
 
-        <PhotoGallery files={files} jobId={job.id} />
+        <PhotoGallery files={files} jobId={job.id} terminology={terminology} />
 
           <section className="data-panel" id="activity">
             <div className="panel-heading compact">
               <h2>Activity</h2>
-              <p className="muted">Recent meaningful changes for this job.</p>
+              <p className="muted">Recent meaningful changes for this {lowerTerm(terminology.job_singular)}.</p>
             </div>
             <div className="activity-timeline">
               {activityRows?.length ? (
                 (activityRows as ActivityRow[]).map((activity) => (
                   <div className="activity-item" key={activity.id}>
                     <span>{dateTimeLabel(activity.created_at)}</span>
-                    <p>{activity.message}</p>
+                    <p>{terminologyActivityMessage(activity.message, terminology)}</p>
                   </div>
                 ))
               ) : (
@@ -397,15 +404,15 @@ export default async function JobDetail({
         <details className="data-panel edit-disclosure" id="edit-job" open={query.edit === "1"}>
           <summary>
             <span>
-              <strong>Edit Job</strong>
-              <em>Update customer, schedule, status, value, and notes.</em>
+              <strong>Edit {terminology.job_singular}</strong>
+              <em>Update {lowerTerm(terminology.customer_singular)}, schedule, status, value, and notes.</em>
             </span>
           </summary>
           <form className="settings-form" action={updateJob}>
             <input type="hidden" name="jobId" value={job.id} />
-          <JobFields customers={customers} end={end} job={job} pipelineStatuses={pipelineStatuses} serviceTypes={serviceTypes} start={start} statusLabels={statusLabels} />
+          <JobFields customers={customers} end={end} job={job} pipelineStatuses={pipelineStatuses} serviceTypes={serviceTypes} start={start} statusLabels={statusLabels} terminology={terminology} />
             <button className="button" type="submit">
-              Save job
+              Save {lowerTerm(terminology.job_singular)}
             </button>
           </form>
         </details>
@@ -460,13 +467,13 @@ function formatIntakeResponse(response: IntakeResponse) {
   return response.value ?? "";
 }
 
-function PhotoGallery({ files, jobId }: { files: JobFile[]; jobId: string }) {
+function PhotoGallery({ files, jobId, terminology }: { files: JobFile[]; jobId: string; terminology: Terminology }) {
   return (
     <section className="data-panel photo-panel">
       <div className="panel-heading compact">
         <div>
           <h2>Project Photos</h2>
-          <p className="muted">Job photos are private to this workspace and open with short-lived preview links.</p>
+          <p className="muted">{terminology.job_singular} photos are private to this workspace and open with short-lived preview links.</p>
         </div>
         <span className="panel-count">{files.length === 1 ? "1 photo" : `${files.length} photos`}</span>
       </div>
@@ -497,14 +504,14 @@ function PhotoGallery({ files, jobId }: { files: JobFile[]; jobId: string }) {
       ) : (
         <div className="photo-empty-state">
           <strong>No photos yet</strong>
-          <p className="muted">Upload before, progress, damage, or completed-work photos so the job record has visual context.</p>
+          <p className="muted">Upload before, progress, damage, or completed-work photos so the {lowerTerm(terminology.job_singular)} record has visual context.</p>
         </div>
       )}
     </section>
   );
 }
 
-function PrimaryJobAction({ job }: { job: Job }) {
+function PrimaryJobAction({ job, terminology }: { job: Job; terminology: Terminology }) {
   if (job.status === "lead") {
     return (
       <form action={markJobContacted}>
@@ -523,7 +530,7 @@ function PrimaryJobAction({ job }: { job: Job }) {
         <input type="hidden" name="returnTo" value={`/jobs/${job.id}`} />
         <input type="hidden" name="status" value="in_progress" />
         <button className="button" type="submit">
-          Start Job
+          Start {terminology.job_singular}
         </button>
       </form>
     );
@@ -536,7 +543,7 @@ function PrimaryJobAction({ job }: { job: Job }) {
         <input type="hidden" name="returnTo" value={`/jobs/${job.id}`} />
         <input type="hidden" name="status" value="completed" />
         <button className="button" type="submit">
-          Complete Job
+          Complete {terminology.job_singular}
         </button>
       </form>
     );
@@ -552,12 +559,12 @@ function PrimaryJobAction({ job }: { job: Job }) {
 
   return (
     <a className="button" href="#quote">
-      Review Quote
+      Review {terminology.quote_singular}
     </a>
   );
 }
 
-function QuotePanel({ job, quote, quoteMessages }: { job: Job; quote: Quote | null; quoteMessages: QuoteMessage[] }) {
+function QuotePanel({ job, quote, quoteMessages, terminology }: { job: Job; quote: Quote | null; quoteMessages: QuoteMessage[]; terminology: Terminology }) {
   const isClosed = job.status === "completed" || job.status === "lost";
   const canSend = quote && quote.status === "draft";
   const canAccept = quote && quote.status !== "accepted" && quote.status !== "declined";
@@ -569,29 +576,29 @@ function QuotePanel({ job, quote, quoteMessages }: { job: Job; quote: Quote | nu
     <section className="data-panel quote-panel" id="quote">
       <div className="panel-heading compact">
         <div>
-          <h2>Quote</h2>
-          <p className="muted">A lightweight estimate tied to this job.</p>
+          <h2>{terminology.quote_singular}</h2>
+          <p className="muted">A lightweight estimate tied to this {lowerTerm(terminology.job_singular)}.</p>
         </div>
         {quote ? <span className={`quote-status quote-status-${quote.status}`}>{quoteStatusLabels[quote.status]}</span> : null}
       </div>
 
       {quote ? (
         <div className="quote-summary">
-          <Info label="Quote amount" value={money(quote.amount_cents)} />
+          <Info label={`${terminology.quote_singular} amount`} value={money(quote.amount_cents)} />
           <Info label="Valid until" value={quote.valid_until ? dateLabel(quote.valid_until) : "Not set"} />
           <Info label="Sent" value={quote.sent_at ? dateLabel(quote.sent_at) : "Not sent"} />
-          <Info label="Current job value" value={money(job.price_cents)} />
-          <Info label="Customer response" value={quote.accepted_at ? `Accepted ${dateLabel(quote.accepted_at)}` : quote.declined_at ? `Declined ${dateLabel(quote.declined_at)}` : "Awaiting response"} />
+          <Info label={`Current ${lowerTerm(terminology.job_singular)} value`} value={money(job.price_cents)} />
+          <Info label={`${terminology.customer_singular} response`} value={quote.accepted_at ? `Accepted ${dateLabel(quote.accepted_at)}` : quote.declined_at ? `Declined ${dateLabel(quote.declined_at)}` : "Awaiting response"} />
         </div>
       ) : (
         <div className="quote-empty">
-          <strong>No quote yet</strong>
-          <p className="muted">Create a draft quote when this opportunity is ready for pricing.</p>
+          <strong>No {lowerTerm(terminology.quote_singular)} yet</strong>
+          <p className="muted">Create a draft {lowerTerm(terminology.quote_singular)} when this opportunity is ready for pricing.</p>
         </div>
       )}
 
       {isClosed ? (
-        <p className="detail-copy empty-copy">Quote changes are locked once a job is completed or lost.</p>
+        <p className="detail-copy empty-copy">{terminology.quote_singular} changes are locked once a {lowerTerm(terminology.job_singular)} is completed or lost.</p>
       ) : (
         <form action={saveQuote} className="quote-form">
           <input type="hidden" name="jobId" value={job.id} />
@@ -611,7 +618,7 @@ function QuotePanel({ job, quote, quoteMessages }: { job: Job; quote: Quote | nu
             <textarea name="quoteNotes" rows={4} defaultValue={quote?.notes ?? ""} placeholder="Short scope, assumptions, or exclusions." />
           </label>
           <button className="button" type="submit">
-            {quote ? "Save Quote" : "Create Quote"}
+            {quote ? `Save ${terminology.quote_singular}` : `Create ${terminology.quote_singular}`}
           </button>
         </form>
       )}
@@ -652,27 +659,27 @@ function QuotePanel({ job, quote, quoteMessages }: { job: Job; quote: Quote | nu
         <div className="quote-customer-area">
           <div className="panel-heading compact">
             <div>
-              <h3>Customer link</h3>
-              <p className="muted">Share this link after marking the quote sent.</p>
+              <h3>{terminology.customer_singular} link</h3>
+            <p className="muted">Share this link after marking the {lowerTerm(terminology.quote_singular)} sent.</p>
             </div>
             <Link className="link-button" href={publicHref} target="_blank">
-              Open customer view
+              Open {lowerTerm(terminology.customer_singular)} view
             </Link>
           </div>
-          <QuoteShareLink href={publicHref} />
+          <QuoteShareLink customerLabel={lowerTerm(terminology.customer_singular)} href={publicHref} quoteLabel={lowerTerm(terminology.quote_singular)} />
           {unresolvedMessages.length ? (
-            <p className="quote-message-alert">{unresolvedMessages.length === 1 ? "1 customer message needs a reply." : `${unresolvedMessages.length} customer messages need a reply.`}</p>
+            <p className="quote-message-alert">{unresolvedMessages.length === 1 ? `1 ${lowerTerm(terminology.customer_singular)} message needs a reply.` : `${unresolvedMessages.length} ${lowerTerm(terminology.customer_singular)} messages need a reply.`}</p>
           ) : null}
         </div>
       ) : null}
 
       {quoteMessages.length ? (
         <div className="quote-messages quote-thread">
-          <h3>Quote conversation</h3>
+          <h3>{terminology.quote_singular} conversation</h3>
           {quoteMessages.map((quoteMessage) => (
             <article className={`quote-message quote-message-${quoteMessage.source}${quoteMessage.resolved_at ? " resolved" : ""}`} key={quoteMessage.id}>
               <div>
-                <span>{quoteMessage.source === "business" ? "Business" : "Customer"} · {dateTimeLabel(quoteMessage.created_at)}</span>
+                <span>{quoteMessage.source === "business" ? "Business" : terminology.customer_singular} · {dateTimeLabel(quoteMessage.created_at)}</span>
                 <p>{quoteMessage.message}</p>
                 {quoteMessage.source === "customer" && quoteMessage.resolved_at ? <em>Answered {dateLabel(quoteMessage.resolved_at)}</em> : null}
                 {quoteMessage.source === "customer" && !quoteMessage.resolved_at ? <em>Waiting for a reply</em> : null}
@@ -686,8 +693,8 @@ function QuotePanel({ job, quote, quoteMessages }: { job: Job; quote: Quote | nu
         <form action={sendQuoteReply} className="quote-reply-form">
           <input type="hidden" name="quoteId" value={quote.id} />
           <label>
-            Reply to customer
-            <textarea name="reply" maxLength={1000} placeholder="Write a short reply about this quote." rows={3} required />
+            Reply to {lowerTerm(terminology.customer_singular)}
+            <textarea name="reply" maxLength={1000} placeholder={`Write a short reply about this ${lowerTerm(terminology.quote_singular)}.`} rows={3} required />
           </label>
           <button className="button button-secondary" type="submit">
             Send Reply
@@ -713,7 +720,7 @@ function Info({ href, label, value }: { href?: string; label: string; value: str
   );
 }
 
-function JobQuickActions({ job }: { job: Job }) {
+function JobQuickActions({ job, terminology }: { job: Job; terminology: Terminology }) {
   if (job.status === "completed" || job.status === "lost") {
     return null;
   }
@@ -722,17 +729,17 @@ function JobQuickActions({ job }: { job: Job }) {
     <section className="data-panel quick-actions-panel">
       <div className="panel-heading compact">
         <h2>Quick actions</h2>
-        <p className="muted">Move this job forward and keep the activity timeline accurate.</p>
+        <p className="muted">Move this {lowerTerm(terminology.job_singular)} forward and keep the activity timeline accurate.</p>
       </div>
       <div className="quick-actions-grid">
         {job.customer?.phone ? (
           <a className="button button-secondary" href={`tel:${job.customer.phone}`}>
-            Call Customer
+            Call {terminology.customer_singular}
           </a>
         ) : null}
         {job.customer?.email ? (
           <a className="button button-secondary" href={`mailto:${job.customer.email}`}>
-            Email Customer
+            Email {terminology.customer_singular}
           </a>
         ) : null}
 
@@ -768,7 +775,7 @@ function JobQuickActions({ job }: { job: Job }) {
             <input type="hidden" name="returnTo" value={`/jobs/${job.id}`} />
             <input type="hidden" name="status" value="in_progress" />
             <button className="button" type="submit">
-              Start Job
+              Start {terminology.job_singular}
             </button>
           </form>
         ) : null}
@@ -779,13 +786,29 @@ function JobQuickActions({ job }: { job: Job }) {
             <input type="hidden" name="returnTo" value={`/jobs/${job.id}`} />
             <input type="hidden" name="status" value="completed" />
             <button className="button" type="submit">
-              Complete Job
+              Complete {terminology.job_singular}
             </button>
           </form>
         ) : null}
       </div>
     </section>
   );
+}
+
+function terminologyActivityMessage(message: string, terminology: Terminology) {
+  return message
+    .replace(/\bCustomer\b/g, terminology.customer_singular)
+    .replace(/\bcustomer\b/g, lowerTerm(terminology.customer_singular))
+    .replace(/\bCustomers\b/g, terminology.customer_plural)
+    .replace(/\bcustomers\b/g, lowerTerm(terminology.customer_plural))
+    .replace(/\bQuote\b/g, terminology.quote_singular)
+    .replace(/\bquote\b/g, lowerTerm(terminology.quote_singular))
+    .replace(/\bQuotes\b/g, terminology.quote_plural)
+    .replace(/\bquotes\b/g, lowerTerm(terminology.quote_plural))
+    .replace(/\bJob\b/g, terminology.job_singular)
+    .replace(/\bjob\b/g, lowerTerm(terminology.job_singular))
+    .replace(/\bJobs\b/g, terminology.job_plural)
+    .replace(/\bjobs\b/g, lowerTerm(terminology.job_plural));
 }
 
 function FollowUpForm({ jobId }: { jobId: string }) {

@@ -6,12 +6,13 @@ type CustomerEditFormProps = {
   addressLine1: string;
   city: string;
   contactCodeSeed: string;
+  customerLabel: string;
   name: string;
   notes: string;
   state: string;
 };
 
-export function CustomerEditFields({ addressLine1, city, contactCodeSeed, name, notes, state }: CustomerEditFormProps) {
+export function CustomerEditFields({ addressLine1, city, contactCodeSeed, customerLabel, name, notes, state }: CustomerEditFormProps) {
   const [phoneCodes, emailCodes] = JSON.parse(contactCodeSeed) as [number[], number[]];
   const contactPhone = String.fromCharCode(...phoneCodes);
   const contactEmail = String.fromCharCode(...emailCodes);
@@ -55,7 +56,7 @@ export function CustomerEditFields({ addressLine1, city, contactCodeSeed, name, 
   return (
     <>
       <div className="field">
-        <label htmlFor="name">Customer name</label>
+        <label htmlFor="name">{customerLabel} name</label>
         <input id="name" name="name" onChange={(event) => updateField("name", event.target.value)} placeholder="Sarah Mitchell" required value={fields.name} />
       </div>
       <div className="split-fields">

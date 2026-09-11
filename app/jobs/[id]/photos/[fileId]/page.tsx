@@ -1,3 +1,5 @@
+import { lowerTerm, normalizeTerminology } from "@/lib/job-tracker/config";
+import type { BusinessTerminology } from "@/lib/job-tracker/types";
 import { createClient } from "@/lib/supabase/server";
 import Link from "next/link";
 import { notFound } from "next/navigation";
@@ -25,6 +27,12 @@ export default async function PhotoPreviewPage({ params }: PhotoPreviewPageProps
     notFound();
   }
 
+  const { data: job } = await supabase.from("jobs").select("business_id").eq("id", id).maybeSingle();
+  const { data: terminologyRow } = job?.business_id
+    ? await supabase.from("business_terminology").select("*").eq("business_id", job.business_id).maybeSingle()
+    : { data: null };
+  const terminology = normalizeTerminology(terminologyRow as BusinessTerminology | null);
+
   const { data: signed } = await supabase.storage.from(photo.storage_bucket).createSignedUrl(photo.storage_path, 60 * 15);
 
   return (
@@ -32,7 +40,7 @@ export default async function PhotoPreviewPage({ params }: PhotoPreviewPageProps
       <div className="detail-header">
         <div>
           <Link className="back-link" href={`/jobs/${id}`}>
-            Back to job
+            Back to {lowerTerm(terminology.job_singular)}
           </Link>
           <p className="eyebrow">Photo</p>
           <h1>{photo.file_name}</h1>

@@ -132,6 +132,23 @@ export type BusinessDashboardWidget = {
   updated_at: string;
 };
 
+export type BusinessTerminology = {
+  id: string;
+  business_id: string;
+  job_singular: string;
+  job_plural: string;
+  customer_singular: string;
+  customer_plural: string;
+  quote_singular: string;
+  quote_plural: string;
+  active_board_title: string | null;
+  upcoming_title: string | null;
+  new_job_button_label: string | null;
+  new_customer_button_label: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 export type IntakeResponse = {
   label: string;
   type: IntakeFieldType;
