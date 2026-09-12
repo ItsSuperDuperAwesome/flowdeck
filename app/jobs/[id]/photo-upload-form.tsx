@@ -13,10 +13,11 @@ const categoryLabels: Record<Exclude<JobFileCategory, "intake">, string> = {
   progress: "Progress",
 };
 
-export function PhotoUploadForm({ jobId }: { jobId: string }) {
+export function PhotoUploadForm({ jobId, supportBusinessId }: { jobId: string; supportBusinessId?: string | null }) {
   return (
     <form action={uploadJobPhotos} className="photo-upload-form">
       <input type="hidden" name="jobId" value={jobId} />
+      {supportBusinessId ? <input type="hidden" name="adminBusinessId" value={supportBusinessId} /> : null}
       <div className="split-fields">
         <label>
           Category

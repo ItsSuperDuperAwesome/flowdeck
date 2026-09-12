@@ -4,15 +4,17 @@ import { useEffect, useState } from "react";
 
 type CustomerEditFormProps = {
   addressLine1: string;
+  addressLine2: string;
   city: string;
   contactCodeSeed: string;
   customerLabel: string;
   name: string;
   notes: string;
+  postalCode: string;
   state: string;
 };
 
-export function CustomerEditFields({ addressLine1, city, contactCodeSeed, customerLabel, name, notes, state }: CustomerEditFormProps) {
+export function CustomerEditFields({ addressLine1, addressLine2, city, contactCodeSeed, customerLabel, name, notes, postalCode, state }: CustomerEditFormProps) {
   const [phoneCodes, emailCodes] = JSON.parse(contactCodeSeed) as [number[], number[]];
   const contactPhone = String.fromCharCode(...phoneCodes);
   const contactEmail = String.fromCharCode(...emailCodes);
@@ -25,11 +27,13 @@ export function CustomerEditFields({ addressLine1, city, contactCodeSeed, custom
 
     return {
       addressLine1,
+      addressLine2,
       city,
       email: contactEmail || headerEmail || "",
       name,
       notes,
       phone: contactPhone || headerPhone || "",
+      postalCode,
       state,
     };
   });
@@ -73,6 +77,10 @@ export function CustomerEditFields({ addressLine1, city, contactCodeSeed, custom
         <label htmlFor="addressLine1">Address line 1</label>
         <input id="addressLine1" name="addressLine1" onChange={(event) => updateField("addressLine1", event.target.value)} placeholder="1200 Maple Street" value={fields.addressLine1} />
       </div>
+      <div className="field">
+        <label htmlFor="addressLine2">Address line 2</label>
+        <input id="addressLine2" name="addressLine2" onChange={(event) => updateField("addressLine2", event.target.value)} placeholder="Suite, unit, building, or gate" value={fields.addressLine2} />
+      </div>
       <div className="split-fields">
         <div className="field">
           <label htmlFor="city">City</label>
@@ -81,6 +89,10 @@ export function CustomerEditFields({ addressLine1, city, contactCodeSeed, custom
         <div className="field two-col">
           <label htmlFor="state">State</label>
           <input id="state" name="state" onChange={(event) => updateField("state", event.target.value)} placeholder="TX" value={fields.state} />
+        </div>
+        <div className="field two-col">
+          <label htmlFor="postalCode">Postal code</label>
+          <input id="postalCode" name="postalCode" onChange={(event) => updateField("postalCode", event.target.value)} placeholder="78701" value={fields.postalCode} />
         </div>
       </div>
       <div className="field">

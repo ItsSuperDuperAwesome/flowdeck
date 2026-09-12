@@ -1,4 +1,4 @@
--- Job Tracker schema
+-- FlowDeck schema
 -- Safe to rerun. This migration keeps legacy job columns while moving the app
 -- to proper customers, customer_id relationships, scheduling fields, and activity.
 
@@ -138,7 +138,7 @@ create table if not exists public.job_files (
 
 alter table public.businesses add column if not exists slug text;
 alter table public.businesses add column if not exists intake_form_enabled boolean not null default true;
-alter table public.businesses add column if not exists intake_form_title text not null default 'Tell us about your project';
+alter table public.businesses add column if not exists intake_form_title text not null default 'Request service';
 alter table public.businesses add column if not exists intake_form_description text not null default 'Share a few details and we will follow up with next steps.';
 
 alter table public.jobs add column if not exists customer_id uuid references public.customers(id) on delete restrict;
@@ -407,6 +407,55 @@ begin
   return new;
 end;
 $$;
+
+create table if not exists public.business_followup_settings (
+  business_id uuid primary key references public.businesses(id) on delete cascade,
+  new_lead_followup_hours integer not null default 24,
+  contacted_followup_days integer not null default 3,
+  proposal_followup_days integer not null default 3,
+  stale_opportunity_days integer not null default 7,
+  reminders_enabled boolean not null default true,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+alter table public.business_followup_settings drop constraint if exists business_followup_settings_new_lead_followup_hours_check;
+alter table public.business_followup_settings add constraint business_followup_settings_new_lead_followup_hours_check
+check (new_lead_followup_hours between 1 and 720);
+
+alter table public.business_followup_settings drop constraint if exists business_followup_settings_contacted_followup_days_check;
+alter table public.business_followup_settings add constraint business_followup_settings_contacted_followup_days_check
+check (contacted_followup_days between 1 and 365);
+
+alter table public.business_followup_settings drop constraint if exists business_followup_settings_proposal_followup_days_check;
+alter table public.business_followup_settings add constraint business_followup_settings_proposal_followup_days_check
+check (proposal_followup_days between 1 and 365);
+
+alter table public.business_followup_settings drop constraint if exists business_followup_settings_stale_opportunity_days_check;
+alter table public.business_followup_settings add constraint business_followup_settings_stale_opportunity_days_check
+check (stale_opportunity_days between 1 and 365);
+
+drop trigger if exists business_followup_settings_set_updated_at on public.business_followup_settings;
+create trigger business_followup_settings_set_updated_at
+before update on public.business_followup_settings
+for each row execute function public.set_updated_at();
+
+alter table public.business_followup_settings enable row level security;
+
+revoke all on table public.business_followup_settings from anon, authenticated;
+grant select, insert, update, delete on table public.business_followup_settings to authenticated;
+
+drop policy if exists "Business members can manage follow-up settings." on public.business_followup_settings;
+create policy "Business members can manage follow-up settings."
+on public.business_followup_settings for all
+to authenticated
+using (private.is_business_member(business_id))
+with check (private.is_business_member(business_id));
+
+insert into public.business_followup_settings (business_id)
+select businesses.id
+from public.businesses
+on conflict (business_id) do nothing;
 
 create table if not exists public.business_terminology (
   id uuid primary key default gen_random_uuid(),
@@ -2228,13 +2277,51 @@ insert into public.business_service_types (business_id, key, label, sort_order)
 select businesses.id, defaults.key, defaults.label, defaults.sort_order
 from public.businesses
 cross join (values
-  ('garage_floor', 'Garage floor', 10),
-  ('patio', 'Patio', 20),
-  ('commercial_floor', 'Commercial floor', 30),
-  ('basement', 'Basement', 40),
-  ('other', 'Other', 50)
+  ('site_visit', 'Site visit', 10),
+  ('new_install', 'New installation', 20),
+  ('repair', 'Repair', 30),
+  ('maintenance', 'Maintenance', 40),
+  ('consultation', 'Consultation', 50),
+  ('other', 'Other', 60)
 ) as defaults(key, label, sort_order)
 on conflict (business_id, key) do nothing;
+
+update public.businesses
+set name = 'FlowDeck'
+where lower(name) = 'flowdeck';
+
+with mismatched as (
+  select
+    id,
+    business_id,
+    lower(
+      regexp_replace(
+        regexp_replace(trim(label), '[^a-zA-Z0-9]+', '_', 'g'),
+        '^_|_$',
+        '',
+        'g'
+      )
+    ) as repaired_key
+  from public.business_service_types
+  where key in ('garage_floor', 'patio', 'commercial_floor', 'basement')
+    and lower(label) not in ('garage floor', 'patio', 'commercial floor', 'basement')
+),
+repairable as (
+  select mismatched.*
+  from mismatched
+  where repaired_key ~ '^[a-z][a-z0-9_]{1,40}$'
+    and not exists (
+      select 1
+      from public.business_service_types existing
+      where existing.business_id = mismatched.business_id
+        and existing.key = mismatched.repaired_key
+        and existing.id <> mismatched.id
+    )
+)
+update public.business_service_types
+set key = repairable.repaired_key
+from repairable
+where business_service_types.id = repairable.id;
 
 insert into public.business_pipeline_statuses (business_id, key, label, semantic_type, sort_order)
 select businesses.id, defaults.key, defaults.label, defaults.semantic_type, defaults.sort_order

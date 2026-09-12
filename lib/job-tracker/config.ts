@@ -1,10 +1,19 @@
-import type { BusinessDashboardWidget, BusinessPipelineStatus, BusinessServiceType, BusinessTerminology, DashboardWidgetKey, JobStatus } from "@/lib/job-tracker/types";
+import type {
+  BusinessDashboardWidget,
+  BusinessFollowupSettings,
+  BusinessPipelineStatus,
+  BusinessServiceType,
+  BusinessTerminology,
+  DashboardWidgetKey,
+  JobStatus,
+} from "@/lib/job-tracker/types";
 
 export const defaultServiceTypes = [
-  { key: "garage_floor", label: "Garage floor" },
-  { key: "patio", label: "Patio" },
-  { key: "commercial_floor", label: "Commercial floor" },
-  { key: "basement", label: "Basement" },
+  { key: "site_visit", label: "Site visit" },
+  { key: "new_install", label: "New installation" },
+  { key: "repair", label: "Repair" },
+  { key: "maintenance", label: "Maintenance" },
+  { key: "consultation", label: "Consultation" },
   { key: "other", label: "Other" },
 ];
 
@@ -56,6 +65,29 @@ export const defaultTerminology = {
   quote_singular: "Quote",
   upcoming_title: "Upcoming",
 };
+
+export const defaultFollowupSettings = {
+  contacted_followup_days: 3,
+  new_lead_followup_hours: 24,
+  proposal_followup_days: 3,
+  reminders_enabled: true,
+  stale_opportunity_days: 7,
+};
+
+export function normalizeFollowupSettings(row?: Partial<BusinessFollowupSettings> | null) {
+  const cleanNumber = (value: number | null | undefined, fallback: number) => {
+    const number = Number(value);
+    return Number.isFinite(number) && number > 0 ? Math.min(365, Math.round(number)) : fallback;
+  };
+
+  return {
+    contacted_followup_days: cleanNumber(row?.contacted_followup_days, defaultFollowupSettings.contacted_followup_days),
+    new_lead_followup_hours: cleanNumber(row?.new_lead_followup_hours, defaultFollowupSettings.new_lead_followup_hours),
+    proposal_followup_days: cleanNumber(row?.proposal_followup_days, defaultFollowupSettings.proposal_followup_days),
+    reminders_enabled: row?.reminders_enabled ?? defaultFollowupSettings.reminders_enabled,
+    stale_opportunity_days: cleanNumber(row?.stale_opportunity_days, defaultFollowupSettings.stale_opportunity_days),
+  };
+}
 
 export function normalizeServiceTypes(rows: BusinessServiceType[] = []) {
   const enabledRows = rows
@@ -157,4 +189,31 @@ export function normalizeTerminology(row?: Partial<BusinessTerminology> | null):
 
 export function lowerTerm(value: string) {
   return value.trim().toLowerCase();
+}
+
+export function displayWorkspaceName(value: string | null | undefined) {
+  const name = String(value ?? "This workspace").trim() || "This workspace";
+  return name.toLowerCase() === "flowdeck" ? "FlowDeck" : name;
+}
+
+export function serviceLabel(value: string | null | undefined, services: BusinessServiceType[] = []) {
+  const cleaned = String(value ?? "").trim();
+
+  if (!cleaned) {
+    return "Not specified";
+  }
+
+  const match = services.find((service) => service.key === cleaned || service.label === cleaned);
+  return match?.label ?? cleaned;
+}
+
+export function serviceKey(value: string | null | undefined, services: BusinessServiceType[] = []) {
+  const cleaned = String(value ?? "").trim();
+
+  if (!cleaned) {
+    return null;
+  }
+
+  const match = services.find((service) => service.key === cleaned || service.label === cleaned);
+  return match?.key ?? cleaned;
 }

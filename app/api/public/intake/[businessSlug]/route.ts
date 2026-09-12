@@ -264,12 +264,16 @@ export async function POST(request: Request, context: { params: Promise<{ busine
   }
 
   const customFields = normalizeFields(formConfig.fields);
-  const configuredServices = ((formConfig as { service_types?: Array<{ label?: unknown }> }).service_types ?? [])
-    .map((service) => (typeof service.label === "string" ? service.label : ""))
-    .filter(Boolean);
-  const validServiceTypes = configuredServices.length ? configuredServices : defaultServiceTypes.map((service) => service.label);
+  const configuredServices = ((formConfig as { service_types?: Array<{ key?: unknown; label?: unknown }> }).service_types ?? [])
+    .map((service) => ({
+      key: typeof service.key === "string" ? service.key : "",
+      label: typeof service.label === "string" ? service.label : "",
+    }))
+    .filter((service) => service.key && service.label);
+  const validServiceTypes = configuredServices.length ? configuredServices : defaultServiceTypes;
+  const matchedService = validServiceTypes.find((service) => service.key === serviceType || service.label === serviceType);
 
-  if (!validServiceTypes.includes(serviceType)) {
+  if (!matchedService) {
     return errorResponse("Please choose an available service type.");
   }
 
@@ -308,7 +312,7 @@ export async function POST(request: Request, context: { params: Promise<{ busine
     postal_code: postalCode || null,
     preferred_date: preferredDate,
     project_description: projectDescription,
-    service_type: serviceType,
+    service_type: matchedService.key,
     square_feet: squareFeet,
     state: state || null,
     street_address: streetAddress || null,

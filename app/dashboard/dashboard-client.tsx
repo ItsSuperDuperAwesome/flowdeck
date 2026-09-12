@@ -3,7 +3,6 @@
 import { logout } from "@/app/auth/actions";
 import {
   archiveIntakeField,
-  archiveServiceType,
   createCustomer,
   createIntakeField,
   createJob,
@@ -15,6 +14,7 @@ import {
   updateBusiness,
   updateCustomer,
   updateDashboardWidgetConfig,
+  updateFollowupSettings,
   updateIntakeField,
   updateIntakeSettings,
   updateJob,
@@ -24,19 +24,31 @@ import {
   updateTerminology,
 } from "@/app/dashboard/actions";
 import {
+  attentionLabel,
+  buildAttentionIssues,
+  issuesByJobId,
+  type AttentionIssue,
+  type AttentionSeverity,
+} from "@/lib/job-tracker/attention";
+import {
   dashboardWidgetRegistry,
   enabledPipelineStatuses,
+  normalizeFollowupSettings,
   normalizeDashboardWidgets,
   normalizePipelineStatuses,
   normalizeServiceTypes,
   normalizeTerminology,
   pipelineLabelMap,
+  displayWorkspaceName,
   lowerTerm,
+  serviceLabel,
+  serviceKey,
   type Terminology,
 } from "@/lib/job-tracker/config";
 import type {
   Business,
   BusinessDashboardWidget,
+  BusinessFollowupSettings,
   BusinessPipelineStatus,
   BusinessServiceType,
   BusinessTerminology,
@@ -49,6 +61,7 @@ import type {
   JobActivity,
   JobSource,
   JobStatus,
+  Quote,
   QuoteMessage,
 } from "@/lib/job-tracker/types";
 import Link from "next/link";
@@ -59,29 +72,24 @@ import { useFormStatus } from "react-dom";
 
 type View = "Overview" | "Pipeline" | "Jobs" | "Customers" | "Calendar" | "Analytics" | "Settings";
 type CalendarMode = "Week" | "Month" | "Agenda";
-type AttentionItem = {
-  action: string;
-  age: string;
-  id: string;
-  job: Job;
-  priority: number;
-  problem: string;
-  quoteMessage?: QuoteMessage;
-  quickAction?: "contacted" | "resolve_quote_message";
-};
-type AttentionSeverity = "high" | "warning" | "info";
+type SupportMode = { businessId: string; businessName: string } | null;
+type JobFilterMode = "all" | "needs-attention";
 
 type DashboardClientProps = {
   activities: JobActivity[];
+  adminMode?: SupportMode;
   business: Business;
   customers: CustomerSummary[];
   dashboardWidgets: BusinessDashboardWidget[];
+  followupSettings: BusinessFollowupSettings | null;
   intakeFields: IntakeField[];
   initialView?: View;
+  initialJobFilter?: JobFilterMode;
   jobs: Job[];
   message?: string;
   pipelineStatuses: BusinessPipelineStatus[];
   quoteMessages: (QuoteMessage & { job: Job | null })[];
+  quotes: Quote[];
   serviceTypes: BusinessServiceType[];
   terminology: BusinessTerminology | null;
   userEmail: string;
@@ -119,8 +127,6 @@ const intakeFieldTypeLabels: Record<IntakeFieldType, string> = {
   short_text: "Short text",
 };
 
-const statusOrder: JobStatus[] = ["lead", "contacted", "quoted", "scheduled", "in_progress", "completed", "lost"];
-const statusChangeOrder: JobStatus[] = ["lead", "contacted", "quoted", "scheduled", "in_progress", "completed"];
 const sourceOrder: JobSource[] = ["website_form", "google", "facebook", "instagram", "referral", "repeat_customer", "phone", "walk_in", "manual", "other"];
 const navItems: View[] = ["Overview", "Pipeline", "Jobs", "Customers", "Calendar", "Analytics", "Settings"];
 const operationalStatuses: JobStatus[] = ["scheduled", "in_progress"];
@@ -185,21 +191,6 @@ function todayLabel() {
   }).format(new Date());
 }
 
-function ageLabel(value: string) {
-  const ageMs = Date.now() - new Date(value).getTime();
-  const days = Math.max(0, Math.floor(ageMs / 86_400_000));
-
-  if (days === 0) {
-    return "New today";
-  }
-
-  if (days === 1) {
-    return "1 day old";
-  }
-
-  return `${days} days old`;
-}
-
 function isStale(job: Job) {
   if (job.status === "completed" || job.status === "lost") {
     return false;
@@ -208,175 +199,35 @@ function isStale(job: Job) {
   return Date.now() - new Date(job.updated_at).getTime() > 3 * 86_400_000;
 }
 
-function dueLabel(value: string) {
-  const diffMs = new Date(value).getTime() - Date.now();
-  const absDays = Math.max(0, Math.ceil(Math.abs(diffMs) / 86_400_000));
-
-  if (diffMs < 0) {
-    if (absDays <= 1) {
-      return "Due today";
-    }
-
-    return `${absDays} days overdue`;
-  }
-
-  if (absDays <= 1) {
-    return "Due soon";
-  }
-
-  return `Due in ${absDays} days`;
-}
-
-function daysSince(value: string) {
-  return Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 86_400_000));
-}
-
-function buildAttentionItems(jobs: Job[], quoteMessages: (QuoteMessage & { job: Job | null })[], terminology: Terminology): AttentionItem[] {
-  const now = Date.now();
-  const staleQuoteMs = 3 * 86_400_000;
-  const soonMs = 7 * 86_400_000;
-  const items: AttentionItem[] = [];
-  const customerTerm = lowerTerm(terminology.customer_singular);
-  const jobTerm = lowerTerm(terminology.job_singular);
-  const quoteTerm = lowerTerm(terminology.quote_singular);
-
-  const unresolvedByQuote = new Map<string, QuoteMessage & { job: Job | null }>();
-  quoteMessages.forEach((quoteMessage) => {
-    if (quoteMessage.source === "customer" && !quoteMessage.resolved_at && !unresolvedByQuote.has(quoteMessage.quote_id)) {
-      unresolvedByQuote.set(quoteMessage.quote_id, quoteMessage);
-    }
-  });
-
-  unresolvedByQuote.forEach((quoteMessage) => {
-    if (!quoteMessage.job || quoteMessage.resolved_at) {
-      return;
-    }
-
-    items.push({
-      action: `Review the question and follow up with the ${customerTerm}.`,
-      age: ageLabel(quoteMessage.created_at),
-      id: `${quoteMessage.id}-quote-message`,
-      job: quoteMessage.job,
-      priority: 0,
-      problem: `${terminology.customer_singular} has a question about a ${quoteTerm}`,
-      quoteMessage,
-      quickAction: "resolve_quote_message",
-    });
-  });
-
-  jobs.forEach((job) => {
-    if (job.status === "completed" || job.status === "lost") {
-      return;
-    }
-
-    if (job.status === "lead" && !job.first_contact_at) {
-      items.push({
-        action: `Contact the ${customerTerm} and mark the lead contacted.`,
-        age: ageLabel(job.created_at),
-        id: `${job.id}-new-lead`,
-        job,
-        priority: 1,
-        problem: "New lead has not been contacted",
-        quickAction: "contacted",
-      });
-    }
-
-    if (job.next_follow_up_at && new Date(job.next_follow_up_at).getTime() <= now) {
-      items.push({
-        action: "Follow up, then set the next follow-up date.",
-        age: dueLabel(job.next_follow_up_at),
-        id: `${job.id}-follow-up-due`,
-        job,
-        priority: 0,
-        problem: "Follow-up is due",
-      });
-    }
-
-    if (
-      job.status === "quoted" &&
-      job.quote_sent_at &&
-      !job.next_follow_up_at &&
-      now - new Date(job.quote_sent_at).getTime() >= staleQuoteMs
-    ) {
-      items.push({
-        action: `Check in on the ${quoteTerm} or set a follow-up.`,
-        age: `${daysSince(job.quote_sent_at)} days since ${quoteTerm}`,
-        id: `${job.id}-stale-quote`,
-        job,
-        priority: 2,
-        problem: `${terminology.quote_singular} is getting stale`,
-      });
-    }
-
-    if ((job.status === "contacted" || job.status === "quoted") && !job.scheduled_start) {
-      items.push({
-        action: `Schedule the ${jobTerm} or mark it lost.`,
-        age: ageLabel(job.updated_at),
-        id: `${job.id}-unscheduled`,
-        job,
-        priority: 4,
-        problem: "Opportunity is not scheduled",
-      });
-    }
-
-    if (job.status === "scheduled" && !job.scheduled_start) {
-      items.push({
-        action: "Add a confirmed start date before treating this as scheduled work.",
-        age: ageLabel(job.updated_at),
-        id: `${job.id}-scheduled-no-date`,
-        job,
-        priority: 0,
-        problem: `Scheduled ${jobTerm} has no start date`,
-      });
-    }
-
-    if (
-      job.status === "scheduled" &&
-      job.scheduled_start &&
-      new Date(job.scheduled_start).getTime() - now <= soonMs &&
-      new Date(job.scheduled_start).getTime() >= now &&
-      !job.job_address
-    ) {
-      items.push({
-        action: "Add the service address before the crew heads out.",
-        age: dueLabel(job.scheduled_start),
-        id: `${job.id}-missing-address`,
-        job,
-        priority: 3,
-        problem: `Upcoming ${jobTerm} is missing an address`,
-      });
-    }
-  });
-
-  return items.sort((a, b) => a.priority - b.priority || a.job.updated_at.localeCompare(b.job.updated_at)).slice(0, 8);
-}
-
-function attentionSeverity(item: AttentionItem): AttentionSeverity {
-  if (item.priority === 0) {
-    return "high";
-  }
-
-  if (item.problem === "New lead has not been contacted") {
-    return daysSince(item.job.created_at) > 0 ? "high" : "warning";
-  }
-
-  if (item.priority === 2 || item.priority === 3) {
-    return "warning";
-  }
-
-  return "info";
-}
-
-function attentionLabel(severity: AttentionSeverity) {
-  return {
-    high: "High",
-    info: "Info",
-    warning: "Warning",
-  }[severity];
-}
-
 function pluralize(count: number, singular: string, plural = `${singular}s`) {
   return `${count} ${count === 1 ? singular : plural}`;
+}
+
+function scopedHref(href: string, supportMode: SupportMode) {
+  if (!supportMode || href.startsWith("#") || href.startsWith("tel:") || href.startsWith("mailto:") || href.startsWith("http")) {
+    return href;
+  }
+
+  const [beforeHash, hash = ""] = href.split("#");
+  const separator = beforeHash.includes("?") ? "&" : "?";
+  const scoped = `${beforeHash}${separator}adminBusinessId=${encodeURIComponent(supportMode.businessId)}`;
+  return hash ? `${scoped}#${hash}` : scoped;
+}
+
+function dashboardHref(view: View, supportMode: SupportMode, filter?: JobFilterMode) {
+  const params = new URLSearchParams();
+
+  if (view !== "Overview") {
+    params.set("view", view);
+  }
+
+  if (filter && filter !== "all") {
+    params.set("filter", filter);
+  }
+
+  const query = params.toString();
+  const base = query ? `/dashboard?${query}` : "/dashboard";
+  return scopedHref(base, supportMode);
 }
 
 function address(customer: Customer | CustomerSummary | null) {
@@ -419,60 +270,77 @@ function SubmitButton({ children }: { children: React.ReactNode }) {
   );
 }
 
-function openJobRow(event: MouseEvent<HTMLTableRowElement>, jobId: string, navigate: (href: string) => void) {
+function SupportModeInput({ supportMode }: { supportMode: SupportMode }) {
+  return supportMode ? <input type="hidden" name="adminBusinessId" value={supportMode.businessId} /> : null;
+}
+
+function issueHref(jobId: string, issueId: string, supportMode: SupportMode) {
+  return scopedHref(`/jobs/${jobId}?issue=${encodeURIComponent(issueId)}#action-required`, supportMode);
+}
+
+function openJobRow(event: MouseEvent<HTMLTableRowElement>, jobId: string, navigate: (href: string) => void, supportMode: SupportMode, issueId?: string) {
   const target = event.target as HTMLElement;
 
   if (target.closest("a, button, input, select, textarea")) {
     return;
   }
 
-  navigate(`/jobs/${jobId}`);
+  navigate(issueId ? issueHref(jobId, issueId, supportMode) : scopedHref(`/jobs/${jobId}`, supportMode));
 }
 
-function openCustomerRow(event: MouseEvent<HTMLTableRowElement>, customerId: string, navigate: (href: string) => void) {
+function openCustomerRow(event: MouseEvent<HTMLTableRowElement>, customerId: string, navigate: (href: string) => void, supportMode: SupportMode) {
   const target = event.target as HTMLElement;
 
   if (target.closest("a, button, input, select, textarea")) {
     return;
   }
 
-  navigate(`/customers/${customerId}`);
+  navigate(scopedHref(`/customers/${customerId}`, supportMode));
 }
 
-function openJobRowFromKeyboard(event: KeyboardEvent<HTMLTableRowElement>, jobId: string, navigate: (href: string) => void) {
+function openJobRowFromKeyboard(event: KeyboardEvent<HTMLTableRowElement>, jobId: string, navigate: (href: string) => void, supportMode: SupportMode, issueId?: string) {
   if (event.key !== "Enter" && event.key !== " ") {
     return;
   }
 
   event.preventDefault();
-  navigate(`/jobs/${jobId}`);
+  navigate(issueId ? issueHref(jobId, issueId, supportMode) : scopedHref(`/jobs/${jobId}`, supportMode));
 }
 
-function openCustomerRowFromKeyboard(event: KeyboardEvent<HTMLTableRowElement>, customerId: string, navigate: (href: string) => void) {
+function openCustomerRowFromKeyboard(event: KeyboardEvent<HTMLTableRowElement>, customerId: string, navigate: (href: string) => void, supportMode: SupportMode) {
   if (event.key !== "Enter" && event.key !== " ") {
     return;
   }
 
   event.preventDefault();
-  navigate(`/customers/${customerId}`);
+  navigate(scopedHref(`/customers/${customerId}`, supportMode));
 }
 
 export function DashboardClient({
   activities,
+  adminMode,
   business,
   customers,
   dashboardWidgets,
+  followupSettings,
+  initialJobFilter = "all",
   intakeFields,
   initialView,
   jobs,
   message,
   pipelineStatuses,
   quoteMessages,
+  quotes,
   serviceTypes,
   terminology,
   userEmail,
 }: DashboardClientProps) {
+  const router = useRouter();
+  const supportMode = adminMode ?? null;
+  const workspaceName = displayWorkspaceName(business.name);
+  const supportWorkspaceName = displayWorkspaceName(supportMode?.businessName);
   const [activeView, setActiveView] = useState<View>(initialView ?? "Overview");
+  const [jobFilterMode, setJobFilterMode] = useState<JobFilterMode>(initialJobFilter);
   const [jobModal, setJobModal] = useState<{ job?: Job; scheduledStart?: Date } | null>(null);
   const [customerModal, setCustomerModal] = useState<CustomerSummary | null | "new">(null);
   const [query, setQuery] = useState("");
@@ -494,6 +362,19 @@ export function DashboardClient({
     [jobs],
   );
 
+  const configuredServices = useMemo(() => normalizeServiceTypes(serviceTypes), [serviceTypes]);
+  const configuredPipelineStatuses = useMemo(() => normalizePipelineStatuses(pipelineStatuses), [pipelineStatuses]);
+  const enabledStatuses = useMemo(() => enabledPipelineStatuses(pipelineStatuses), [pipelineStatuses]);
+  const configuredStatusLabels = useMemo(() => pipelineLabelMap(pipelineStatuses), [pipelineStatuses]);
+  const configuredDashboardWidgets = useMemo(() => normalizeDashboardWidgets(dashboardWidgets), [dashboardWidgets]);
+  const configuredFollowupSettings = useMemo(() => normalizeFollowupSettings(followupSettings), [followupSettings]);
+  const terms = useMemo(() => normalizeTerminology(terminology), [terminology]);
+  const needsAttention = useMemo(
+    () => buildAttentionIssues({ activities, followupSettings: configuredFollowupSettings, jobs, quoteMessages, quotes, terminology: terms }),
+    [activities, configuredFollowupSettings, jobs, quoteMessages, quotes, terms],
+  );
+  const attentionByJob = useMemo(() => issuesByJobId(needsAttention), [needsAttention]);
+  const attentionJobIds = useMemo(() => new Set(attentionByJob.keys()), [attentionByJob]);
   const normalizedQuery = query.trim().toLowerCase();
   const filteredJobs = useMemo(
     () =>
@@ -505,6 +386,7 @@ export function DashboardClient({
             .toLowerCase();
 
           return (
+            (jobFilterMode === "all" || activeView !== "Jobs" || attentionJobIds.has(job.id)) &&
             (statusFilter === "all" || job.status === statusFilter) &&
             (!normalizedQuery || searchable.includes(normalizedQuery))
           );
@@ -534,7 +416,7 @@ export function DashboardClient({
           const bDate = b.scheduled_start ?? "9999-12-31";
           return aDate.localeCompare(bDate);
         }),
-    [jobs, normalizedQuery, sort, statusFilter],
+    [activeView, attentionJobIds, jobFilterMode, jobs, normalizedQuery, sort, statusFilter],
   );
 
   const visibleCustomers = useMemo(
@@ -558,14 +440,6 @@ export function DashboardClient({
     .filter((job) => job.scheduled_start && operationalStatuses.includes(job.status))
     .sort((a, b) => String(a.scheduled_start).localeCompare(String(b.scheduled_start)))
     .slice(0, 5);
-  const configuredServices = useMemo(() => normalizeServiceTypes(serviceTypes), [serviceTypes]);
-  const configuredPipelineStatuses = useMemo(() => normalizePipelineStatuses(pipelineStatuses), [pipelineStatuses]);
-  const enabledStatuses = useMemo(() => enabledPipelineStatuses(pipelineStatuses), [pipelineStatuses]);
-  const configuredStatusLabels = useMemo(() => pipelineLabelMap(pipelineStatuses), [pipelineStatuses]);
-  const configuredDashboardWidgets = useMemo(() => normalizeDashboardWidgets(dashboardWidgets), [dashboardWidgets]);
-  const terms = useMemo(() => normalizeTerminology(terminology), [terminology]);
-  const needsAttention = useMemo(() => buildAttentionItems(jobs, quoteMessages, terms), [jobs, quoteMessages, terms]);
-
   const showSearch = activeView === "Overview" || activeView === "Pipeline" || activeView === "Jobs" || activeView === "Customers";
 
   function moveCalendar(direction: number) {
@@ -580,15 +454,21 @@ export function DashboardClient({
 
   return (
     <>
+      {supportMode ? (
+        <div className="support-mode-banner">
+          <strong>Viewing {supportWorkspaceName} as FlowDeck Admin</strong>
+          <a href={`/admin/workspaces/${supportMode.businessId}`}>Exit admin view</a>
+        </div>
+      ) : null}
       <div className="app-shell">
         <aside className="sidebar">
           <div className="brand-block">
             <div className="brand-mark" aria-hidden="true">
-              JT
+              FD
             </div>
             <div>
               <p>Workspace</p>
-              <strong>{business.name}</strong>
+              <strong>{workspaceName}</strong>
             </div>
           </div>
 
@@ -597,7 +477,13 @@ export function DashboardClient({
               <button
                 className={activeView === item ? "active" : ""}
                 key={item}
-                onClick={() => setActiveView(item)}
+                onClick={() => {
+                  if (item === "Jobs") {
+                    setJobFilterMode("all");
+                  }
+                  setActiveView(item);
+                  router.replace(dashboardHref(item, supportMode), { scroll: false });
+                }}
                 type="button"
               >
                 <span aria-hidden="true">{navIcons[item]}</span>
@@ -672,8 +558,8 @@ export function DashboardClient({
               jobs={filteredJobs}
               needsAttention={needsAttention}
               onCreateJob={() => setJobModal({})}
-              onViewJobs={() => setActiveView("Jobs")}
               pipelineStatuses={configuredPipelineStatuses}
+              supportMode={supportMode}
               totalPipeline={totalPipeline}
               upcomingJobs={upcomingJobs}
               averageJobValue={averageJobValue}
@@ -687,19 +573,33 @@ export function DashboardClient({
               jobs={jobs}
               pipelineStatuses={configuredPipelineStatuses}
               setSort={setSort}
+              setJobFilterMode={setJobFilterMode}
               setStatusFilter={setStatusFilter}
               sort={sort}
+              attentionByJob={attentionByJob}
+              attentionFilterCount={attentionJobIds.size}
+              jobFilterMode={jobFilterMode}
               statusFilter={statusFilter}
+              supportMode={supportMode}
               terminology={terms}
             />
           ) : null}
 
           {activeView === "Pipeline" ? (
-            <PipelineView jobs={filteredJobs} pipelineStatuses={enabledStatuses} statusLabels={configuredStatusLabels} terminology={terms} totalJobs={jobs.length} />
+            <PipelineView
+              attentionByJob={attentionByJob}
+              jobs={filteredJobs}
+              activities={activities}
+              pipelineStatuses={enabledStatuses}
+              statusLabels={configuredStatusLabels}
+              supportMode={supportMode}
+              terminology={terms}
+              totalJobs={jobs.length}
+            />
           ) : null}
 
           {activeView === "Customers" ? (
-            <CustomersView customers={visibleCustomers} hasCustomers={customers.length > 0} onCreate={() => setCustomerModal("new")} terminology={terms} />
+            <CustomersView customers={visibleCustomers} hasCustomers={customers.length > 0} onCreate={() => setCustomerModal("new")} supportMode={supportMode} terminology={terms} />
           ) : null}
 
           {activeView === "Calendar" ? (
@@ -711,6 +611,7 @@ export function DashboardClient({
               onModeChange={setCalendarMode}
               onMove={moveCalendar}
               onToday={() => setCalendarDate(new Date())}
+              supportMode={supportMode}
             />
           ) : null}
 
@@ -731,9 +632,11 @@ export function DashboardClient({
             <SettingsView
               business={business}
               dashboardWidgets={configuredDashboardWidgets}
+              followupSettings={configuredFollowupSettings}
               intakeFields={intakeFields}
               pipelineStatuses={configuredPipelineStatuses}
               serviceTypes={serviceTypes.length ? serviceTypes : configuredServices}
+              supportMode={supportMode}
               terminology={terms}
             />
           ) : null}
@@ -748,6 +651,7 @@ export function DashboardClient({
           onClose={() => setJobModal(null)}
           scheduledStart={jobModal.scheduledStart}
           serviceTypes={configuredServices}
+          supportBusinessId={supportMode?.businessId ?? null}
           pipelineStatuses={enabledStatuses}
           statusLabels={configuredStatusLabels}
           terminology={terms}
@@ -759,6 +663,7 @@ export function DashboardClient({
           businessId={business.id}
           customer={customerModal === "new" ? null : customerModal}
           onClose={() => setCustomerModal(null)}
+          supportBusinessId={supportMode?.businessId ?? null}
           terminology={terms}
         />
       ) : null}
@@ -775,8 +680,8 @@ function OverviewView({
   jobs,
   needsAttention,
   onCreateJob,
-  onViewJobs,
   pipelineStatuses,
+  supportMode,
   terminology,
   totalPipeline,
   upcomingJobs,
@@ -787,10 +692,10 @@ function OverviewView({
   counts: Record<JobStatus, number>;
   dashboardWidgets: ReturnType<typeof normalizeDashboardWidgets>;
   jobs: Job[];
-  needsAttention: AttentionItem[];
+  needsAttention: AttentionIssue[];
   onCreateJob: () => void;
-  onViewJobs: () => void;
   pipelineStatuses: BusinessPipelineStatus[];
+  supportMode: SupportMode;
   terminology: Terminology;
   totalPipeline: number;
   upcomingJobs: Job[];
@@ -807,21 +712,21 @@ function OverviewView({
         terminology={terminology}
         totalPipeline={totalPipeline}
       />
-      {widgetEnabled("needs_attention") ? <NeedsAttentionPanel items={needsAttention} onViewJobs={onViewJobs} terminology={terminology} /> : null}
+      {widgetEnabled("needs_attention") ? <NeedsAttentionPanel items={needsAttention} supportMode={supportMode} terminology={terminology} /> : null}
       <section className="content-grid">
-        {widgetEnabled("active_job_board") ? <JobsPanel jobs={jobs.slice(0, 6)} pipelineStatuses={pipelineStatuses} terminology={terminology} title={terminology.active_board_title} /> : null}
-        {widgetEnabled("upcoming") ? <SideSummary activities={activities} onCreateJob={onCreateJob} terminology={terminology} upcomingJobs={upcomingJobs} /> : null}
+        {widgetEnabled("active_job_board") ? <JobsPanel jobs={jobs.slice(0, 6)} pipelineStatuses={pipelineStatuses} supportMode={supportMode} terminology={terminology} title={terminology.active_board_title} /> : null}
+        {widgetEnabled("upcoming") ? <SideSummary activities={activities} onCreateJob={onCreateJob} supportMode={supportMode} terminology={terminology} upcomingJobs={upcomingJobs} /> : null}
       </section>
     </>
   );
 }
 
-function NeedsAttentionPanel({ items, onViewJobs, terminology }: { items: AttentionItem[]; onViewJobs: () => void; terminology: Terminology }) {
+function NeedsAttentionPanel({ items, supportMode, terminology }: { items: AttentionIssue[]; supportMode: SupportMode; terminology: Terminology }) {
   const visibleItems = items.slice(0, 4);
   const hiddenCount = Math.max(items.length - visibleItems.length, 0);
   const severityCounts = items.reduce(
     (counts, item) => {
-      counts[attentionSeverity(item)] += 1;
+      counts[item.severity] += 1;
       return counts;
     },
     { high: 0, info: 0, warning: 0 } satisfies Record<AttentionSeverity, number>,
@@ -846,7 +751,7 @@ function NeedsAttentionPanel({ items, onViewJobs, terminology }: { items: Attent
         <>
           <div className="attention-list">
           {visibleItems.map((item) => {
-            const severity = attentionSeverity(item);
+            const severity = item.severity;
 
             return (
               <div className={`attention-item attention-${severity}`} key={item.id}>
@@ -867,7 +772,7 @@ function NeedsAttentionPanel({ items, onViewJobs, terminology }: { items: Attent
                   {item.quickAction === "contacted" ? (
                     <form action={markJobContacted}>
                       <input type="hidden" name="jobId" value={item.job.id} />
-                      <input type="hidden" name="returnTo" value="/dashboard" />
+                      <input type="hidden" name="returnTo" value={dashboardHref("Overview", supportMode)} />
                       <button className="link-button" type="submit">
                         Mark Contacted
                       </button>
@@ -876,12 +781,13 @@ function NeedsAttentionPanel({ items, onViewJobs, terminology }: { items: Attent
                   {item.quickAction === "resolve_quote_message" && item.quoteMessage ? (
                     <form action={resolveQuoteMessage}>
                       <input type="hidden" name="messageId" value={item.quoteMessage.id} />
+                      <SupportModeInput supportMode={supportMode} />
                       <button className="link-button" type="submit">
                         Mark Answered
                       </button>
                     </form>
                   ) : null}
-                  <Link className="link-button" href={`/jobs/${item.job.id}`}>
+                  <Link className="link-button" href={issueHref(item.job.id, item.id, supportMode)}>
                     Open
                   </Link>
                 </div>
@@ -892,9 +798,9 @@ function NeedsAttentionPanel({ items, onViewJobs, terminology }: { items: Attent
           {hiddenCount ? (
             <div className="attention-footer">
               <span>{pluralize(hiddenCount, "more item")} needs follow-up.</span>
-              <button className="link-button" onClick={onViewJobs} type="button">
-                View all {lowerTerm(terminology.job_plural)}
-              </button>
+              <Link className="link-button" href={dashboardHref("Jobs", supportMode, "needs-attention")}>
+                View all attention items
+              </Link>
             </div>
           ) : null}
         </>
@@ -914,33 +820,48 @@ function NeedsAttentionPanel({ items, onViewJobs, terminology }: { items: Attent
 }
 
 function JobsView({
+  attentionByJob,
+  attentionFilterCount,
   filteredJobs,
+  jobFilterMode,
   jobs,
   pipelineStatuses,
+  setJobFilterMode,
   setSort,
   setStatusFilter,
   sort,
   statusFilter,
+  supportMode,
   terminology,
 }: {
+  attentionByJob: Map<string, AttentionIssue[]>;
+  attentionFilterCount: number;
   filteredJobs: Job[];
+  jobFilterMode: JobFilterMode;
   jobs: Job[];
   pipelineStatuses: BusinessPipelineStatus[];
+  setJobFilterMode: (value: JobFilterMode) => void;
   setSort: (value: string) => void;
   setStatusFilter: (value: "all" | JobStatus) => void;
   sort: string;
   statusFilter: "all" | JobStatus;
+  supportMode: SupportMode;
   terminology: Terminology;
 }) {
   return (
     <JobsPanel
       fullWidth
+      attentionByJob={attentionByJob}
+      attentionFilterCount={attentionFilterCount}
+      jobFilterMode={jobFilterMode}
       jobs={filteredJobs}
       pipelineStatuses={pipelineStatuses}
+      setJobFilterMode={setJobFilterMode}
       setSort={setSort}
       setStatusFilter={setStatusFilter}
       sort={sort}
       statusFilter={statusFilter}
+      supportMode={supportMode}
       terminology={terminology}
       title={terminology.job_plural}
       totalJobs={jobs.length}
@@ -949,20 +870,26 @@ function JobsView({
 }
 
 function PipelineView({
+  activities,
+  attentionByJob,
   jobs,
   pipelineStatuses,
   statusLabels,
+  supportMode,
   terminology,
   totalJobs,
 }: {
+  activities: JobActivity[];
+  attentionByJob: Map<string, AttentionIssue[]>;
   jobs: Job[];
   pipelineStatuses: BusinessPipelineStatus[];
   statusLabels: Record<JobStatus, string>;
+  supportMode: SupportMode;
   terminology: Terminology;
   totalJobs: number;
 }) {
   const groupedJobs = pipelineStatuses.map((statusConfig) => ({
-    jobs: jobs.filter((job) => job.status === statusConfig.semantic_type),
+    jobs: sortPipelineJobs(jobs.filter((job) => job.status === statusConfig.semantic_type), attentionByJob, activities),
     status: statusConfig.semantic_type,
   }));
 
@@ -981,12 +908,25 @@ function PipelineView({
           {groupedJobs.map(({ status, jobs: columnJobs }) => (
             <section className="pipeline-column" key={status}>
               <div className="pipeline-column-header">
-                <span className={`status-pill status-${status}`}>{statusLabels[status]}</span>
-                <strong>{columnJobs.length}</strong>
+                <div>
+                  <span className={`status-pill status-${status}`}>{statusLabels[status]}</span>
+                  <p>{pluralize(columnJobs.length, "opportunity", "opportunities")} · {money(stageOpenValue(status, columnJobs))}</p>
+                </div>
               </div>
               <div className="pipeline-cards">
                 {columnJobs.length ? (
-                  columnJobs.map((job) => <PipelineCard job={job} key={job.id} pipelineStatuses={pipelineStatuses} statusLabels={statusLabels} />)
+                  columnJobs.map((job) => (
+                    <PipelineCard
+                      issues={attentionByJob.get(job.id) ?? []}
+                      job={job}
+                      key={job.id}
+                      pipelineStatuses={pipelineStatuses}
+                      stageAge={stageAgeLabel(job, activities)}
+                      statusLabels={statusLabels}
+                      supportMode={supportMode}
+                      terminology={terminology}
+                    />
+                  ))
                 ) : (
                   <p className="pipeline-empty">No {statusLabels[status].toLowerCase()} jobs.</p>
                 )}
@@ -1004,20 +944,103 @@ function PipelineView({
   );
 }
 
+function stageOpenValue(status: JobStatus, jobs: Job[]) {
+  if (status === "lost") {
+    return 0;
+  }
+
+  return jobs.reduce((sum, job) => sum + job.price_cents, 0);
+}
+
+function stageEnteredAt(job: Job, activities: JobActivity[]) {
+  if (job.status === "lead") {
+    return job.created_at;
+  }
+
+  const matchingActivity = activities.find((activity) => {
+    if (activity.job_id !== job.id) {
+      return false;
+    }
+
+    if ((activity.metadata as { to?: unknown } | null)?.to === job.status) {
+      return true;
+    }
+
+    return (
+      (job.status === "contacted" && activity.event_type === "contacted") ||
+      (job.status === "quoted" && (activity.event_type === "quoted" || activity.event_type === "quote_sent")) ||
+      (job.status === "completed" && activity.event_type === "completed") ||
+      (job.status === "lost" && activity.event_type === "lost")
+    );
+  });
+
+  return matchingActivity?.created_at ?? null;
+}
+
+function stageAgeLabel(job: Job, activities: JobActivity[]) {
+  const enteredAt = stageEnteredAt(job, activities);
+
+  if (!enteredAt) {
+    return "Stage age unavailable";
+  }
+
+  const days = Math.max(0, Math.floor((Date.now() - new Date(enteredAt).getTime()) / 86_400_000));
+
+  if (days === 0) {
+    return "Entered today";
+  }
+
+  return `${days} ${days === 1 ? "day" : "days"} in stage`;
+}
+
+function sortPipelineJobs(jobs: Job[], attentionByJob: Map<string, AttentionIssue[]>, activities: JobActivity[]) {
+  return [...jobs].sort((a, b) => {
+    if (a.status === "lost" && b.status === "lost") {
+      return b.updated_at.localeCompare(a.updated_at);
+    }
+
+    const aIssue = attentionByJob.get(a.id)?.[0];
+    const bIssue = attentionByJob.get(b.id)?.[0];
+    const aPriority = aIssue ? aIssue.priority : 99;
+    const bPriority = bIssue ? bIssue.priority : 99;
+
+    if (aPriority !== bPriority) {
+      return aPriority - bPriority;
+    }
+
+    const aEnteredAt = stageEnteredAt(a, activities) ?? a.created_at;
+    const bEnteredAt = stageEnteredAt(b, activities) ?? b.created_at;
+
+    if (aEnteredAt !== bEnteredAt) {
+      return aEnteredAt.localeCompare(bEnteredAt);
+    }
+
+    return b.price_cents - a.price_cents || a.title.localeCompare(b.title);
+  });
+}
+
 function PipelineCard({
+  issues,
   job,
   pipelineStatuses,
+  stageAge,
   statusLabels,
+  supportMode,
+  terminology,
 }: {
+  issues: AttentionIssue[];
   job: Job;
   pipelineStatuses: BusinessPipelineStatus[];
+  stageAge: string;
   statusLabels: Record<JobStatus, string>;
+  supportMode: SupportMode;
+  terminology: Terminology;
 }) {
   const scheduledText = job.scheduled_start ? `${dateLabel(job.scheduled_start)} at ${timeLabel(job.scheduled_start)}` : null;
 
   return (
     <article className="pipeline-card">
-      <Link className="pipeline-card-main" href={`/jobs/${job.id}`}>
+      <Link className="pipeline-card-main" href={scopedHref(`/jobs/${job.id}`, supportMode)}>
         <div>
           <p>{job.customer?.name ?? "Unknown customer"}</p>
           <h3>{job.title}</h3>
@@ -1029,14 +1052,16 @@ function PipelineCard({
             <span>{scheduledText}</span>
           ) : null}
         </div>
-        <span className={isStale(job) ? "age-chip stale" : "age-chip"}>{ageLabel(job.created_at)}</span>
+        <span className={isStale(job) ? "age-chip stale" : "age-chip"}>{stageAge}</span>
       </Link>
+      <AttentionIndicator issues={issues} supportMode={supportMode} />
+      <PipelineQuickActions issues={issues} job={job} supportMode={supportMode} terminology={terminology} />
       {job.status === "lost" ? (
         <span className={`status-pill status-${job.status}`}>{statusLabels[job.status]}</span>
       ) : (
         <form action={updateJobStatus} className="pipeline-status-form">
           <input type="hidden" name="jobId" value={job.id} />
-          <input type="hidden" name="returnTo" value="/dashboard?view=Pipeline" />
+          <input type="hidden" name="returnTo" value={dashboardHref("Pipeline", supportMode)} />
           <select
             aria-label={`Update ${job.title} status`}
             className={`status-select status-${job.status}`}
@@ -1056,31 +1081,147 @@ function PipelineCard({
   );
 }
 
+function PipelineQuickActions({ issues, job, supportMode, terminology }: { issues: AttentionIssue[]; job: Job; supportMode: SupportMode; terminology: Terminology }) {
+  const primaryIssue = issues[0];
+
+  if (job.status === "lost" || job.status === "completed") {
+    return (
+      <div className="pipeline-card-actions">
+        <Link className="link-button" href={scopedHref(`/jobs/${job.id}`, supportMode)}>
+          Open
+        </Link>
+      </div>
+    );
+  }
+
+  if (primaryIssue?.quickAction === "contacted" || job.status === "lead") {
+    return (
+      <div className="pipeline-card-actions">
+        <form action={markJobContacted}>
+          <input type="hidden" name="jobId" value={job.id} />
+          <input type="hidden" name="returnTo" value={dashboardHref("Pipeline", supportMode)} />
+          <SupportModeInput supportMode={supportMode} />
+          <button className="link-button" type="submit">
+            Mark Contacted
+          </button>
+        </form>
+        <Link className="link-button" href={primaryIssue ? issueHref(job.id, primaryIssue.id, supportMode) : scopedHref(`/jobs/${job.id}`, supportMode)}>
+          Open
+        </Link>
+      </div>
+    );
+  }
+
+  if (primaryIssue?.type === "unscheduled" || primaryIssue?.type === "scheduled_no_date" || primaryIssue?.type === "missing_address") {
+    return (
+      <div className="pipeline-card-actions">
+        <Link className="link-button" href={scopedHref(`/jobs/${job.id}?edit=1#edit-job`, supportMode)}>
+          {primaryIssue.type === "missing_address" ? "Add Address" : "Schedule"}
+        </Link>
+        <Link className="link-button" href={issueHref(job.id, primaryIssue.id, supportMode)}>
+          Open
+        </Link>
+      </div>
+    );
+  }
+
+  if (
+    primaryIssue?.type === "follow_up_due" ||
+    primaryIssue?.type === "follow_up_today" ||
+    primaryIssue?.type === "contacted_follow_up" ||
+    primaryIssue?.type === "proposal_awaiting_response" ||
+    primaryIssue?.type === "stale_opportunity"
+  ) {
+    return (
+      <div className="pipeline-card-actions">
+        <Link className="link-button" href={issueHref(job.id, primaryIssue.id, supportMode)}>
+          Set Follow-Up
+        </Link>
+        {job.status === "quoted" || primaryIssue.type === "proposal_awaiting_response" ? (
+          <Link className="link-button" href={scopedHref(`/jobs/${job.id}#quote`, supportMode)}>
+            Review {terminology.quote_singular}
+          </Link>
+        ) : null}
+      </div>
+    );
+  }
+
+  if (job.status === "quoted") {
+    return (
+      <div className="pipeline-card-actions">
+        <Link className="link-button" href={scopedHref(`/jobs/${job.id}#quote`, supportMode)}>
+          Review {terminology.quote_singular}
+        </Link>
+        <Link className="link-button" href={primaryIssue ? issueHref(job.id, primaryIssue.id, supportMode) : scopedHref(`/jobs/${job.id}`, supportMode)}>
+          Open
+        </Link>
+      </div>
+    );
+  }
+
+  return (
+    <div className="pipeline-card-actions">
+      <Link className="link-button" href={primaryIssue ? issueHref(job.id, primaryIssue.id, supportMode) : scopedHref(`/jobs/${job.id}#action-required`, supportMode)}>
+        {primaryIssue ? "Resolve" : "Open"}
+      </Link>
+    </div>
+  );
+}
+
+function AttentionIndicator({ issues, supportMode }: { issues: AttentionIssue[]; supportMode: SupportMode }) {
+  const primary = issues[0];
+
+  if (!primary) {
+    return null;
+  }
+
+  const label = issues.length > 1 ? `${issues.length} issues` : "1 issue";
+
+  return (
+    <Link className={`attention-chip attention-chip-${primary.severity}`} href={issueHref(primary.job.id, primary.id, supportMode)}>
+      <span aria-hidden="true">!</span>
+      <strong>{label}</strong>
+      <em>{primary.problem}</em>
+    </Link>
+  );
+}
+
 function JobsPanel({
+  attentionByJob,
+  attentionFilterCount = 0,
   fullWidth = false,
+  jobFilterMode = "all",
   jobs,
   pipelineStatuses = normalizePipelineStatuses(),
+  setJobFilterMode,
   setSort,
   setStatusFilter,
   sort,
   statusFilter,
+  supportMode,
   terminology = normalizeTerminology(),
   title,
   totalJobs,
 }: {
+  attentionByJob?: Map<string, AttentionIssue[]>;
+  attentionFilterCount?: number;
   fullWidth?: boolean;
+  jobFilterMode?: JobFilterMode;
   jobs: Job[];
   pipelineStatuses?: BusinessPipelineStatus[];
+  setJobFilterMode?: (value: JobFilterMode) => void;
   setSort?: (value: string) => void;
   setStatusFilter?: (value: "all" | JobStatus) => void;
   sort?: string;
   statusFilter?: "all" | JobStatus;
+  supportMode?: SupportMode;
   terminology?: Terminology;
   title: string;
   totalJobs?: number;
 }) {
   const router = useRouter();
   const statusLabelMap = Object.fromEntries(pipelineStatuses.map((status) => [status.semantic_type, status.label])) as Record<JobStatus, string>;
+  const showAttentionFilter = Boolean(setJobFilterMode && setStatusFilter && setSort);
 
   return (
     <div className={fullWidth ? "data-panel jobs-panel full-width" : "data-panel jobs-panel"}>
@@ -1112,6 +1253,30 @@ function JobsPanel({
           </div>
         ) : null}
       </div>
+      {showAttentionFilter ? (
+        <div className="opportunity-filter-tabs" aria-label={`${terminology.job_plural} filters`}>
+          <button
+            className={jobFilterMode === "all" ? "active" : ""}
+            onClick={() => {
+              setJobFilterMode?.("all");
+              router.replace(dashboardHref("Jobs", supportMode ?? null), { scroll: false });
+            }}
+            type="button"
+          >
+            All {terminology.job_plural}
+          </button>
+          <button
+            className={jobFilterMode === "needs-attention" ? "active attention-filter" : "attention-filter"}
+            onClick={() => {
+              setJobFilterMode?.("needs-attention");
+              router.replace(dashboardHref("Jobs", supportMode ?? null, "needs-attention"), { scroll: false });
+            }}
+            type="button"
+          >
+            Needs Attention <span>{attentionFilterCount}</span>
+          </button>
+        </div>
+      ) : null}
 
       {jobs.length ? (
         <div className="jobs-table-wrap">
@@ -1127,27 +1292,32 @@ function JobsPanel({
               </tr>
             </thead>
             <tbody>
-              {jobs.map((job) => (
+              {jobs.map((job) => {
+                const issues = attentionByJob?.get(job.id) ?? [];
+                const primaryIssue = issues[0];
+
+                return (
                 <tr
                   className="clickable-row"
                   key={job.id}
-                  onClick={(event) => openJobRow(event, job.id, router.push)}
-                  onKeyDown={(event) => openJobRowFromKeyboard(event, job.id, router.push)}
+                  onClick={(event) => openJobRow(event, job.id, router.push, supportMode ?? null, jobFilterMode === "needs-attention" ? primaryIssue?.id : undefined)}
+                  onKeyDown={(event) => openJobRowFromKeyboard(event, job.id, router.push, supportMode ?? null, jobFilterMode === "needs-attention" ? primaryIssue?.id : undefined)}
                   role="link"
                   tabIndex={0}
                 >
                   <td className="identity-cell">
-                    <Link className="row-title-link" href={`/jobs/${job.id}`}>
+                    <Link className="row-title-link" href={scopedHref(`/jobs/${job.id}`, supportMode ?? null)}>
                       {job.title}
                     </Link>
                     <span>
                       {job.customer ? (
-                        <Link href={`/customers/${job.customer.id}`}>{job.customer.name}</Link>
+                        <Link href={scopedHref(`/customers/${job.customer.id}`, supportMode ?? null)}>{job.customer.name}</Link>
                       ) : (
                         "Unknown customer"
                       )}
                       {job.source && job.source !== "manual" ? ` · ${sourceLabels[job.source]}` : ""}
                     </span>
+                    <AttentionIndicator issues={issues} supportMode={supportMode ?? null} />
                   </td>
                   <td>
                     {job.status === "lost" ? (
@@ -1155,7 +1325,7 @@ function JobsPanel({
                     ) : (
                       <form action={updateJobStatus}>
                         <input type="hidden" name="jobId" value={job.id} />
-                        <input type="hidden" name="returnTo" value="/dashboard?view=Jobs" />
+                        <input type="hidden" name="returnTo" value={dashboardHref("Jobs", supportMode ?? null, jobFilterMode)} />
                         <select
                           className={`status-select status-${job.status}`}
                           aria-label={`Update ${job.title} status`}
@@ -1182,7 +1352,8 @@ function JobsPanel({
                     &rarr;
                   </td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -1291,11 +1462,13 @@ function widgetLabel(widget: ReturnType<typeof normalizeDashboardWidgets>[number
 function SideSummary({
   activities,
   onCreateJob,
+  supportMode,
   terminology,
   upcomingJobs,
 }: {
   activities: JobActivity[];
   onCreateJob: () => void;
+  supportMode: SupportMode;
   terminology: Terminology;
   upcomingJobs: Job[];
 }) {
@@ -1309,7 +1482,7 @@ function SideSummary({
           {upcomingJobs.map((job) => (
             <li key={job.id}>
               <span>{dateLabel(job.scheduled_start)} at {timeLabel(job.scheduled_start)}</span>
-              <Link href={`/jobs/${job.id}`}>
+              <Link href={scopedHref(`/jobs/${job.id}`, supportMode)}>
                 <strong>{job.customer?.name ?? terminology.customer_singular}</strong>
               </Link>
               <p>{job.title}</p>
@@ -1331,7 +1504,7 @@ function SideSummary({
           {activities.length ? (
             activities.slice(0, 6).map((activity) => (
               <p key={activity.id}>
-                {activity.job ? <Link href={`/jobs/${activity.job_id}`}>{activity.job.title}</Link> : terminology.job_singular}
+                {activity.job ? <Link href={scopedHref(`/jobs/${activity.job_id}`, supportMode)}>{activity.job.title}</Link> : terminology.job_singular}
                 <span> {terminologyActivityMessage(activity.message, terminology)}</span>
               </p>
             ))
@@ -1348,11 +1521,13 @@ function CustomersView({
   customers,
   hasCustomers,
   onCreate,
+  supportMode,
   terminology,
 }: {
   customers: CustomerSummary[];
   hasCustomers: boolean;
   onCreate: () => void;
+  supportMode: SupportMode;
   terminology: Terminology;
 }) {
   const router = useRouter();
@@ -1382,13 +1557,13 @@ function CustomersView({
                 <tr
                   className="clickable-row"
                   key={customer.id}
-                  onClick={(event) => openCustomerRow(event, customer.id, router.push)}
-                  onKeyDown={(event) => openCustomerRowFromKeyboard(event, customer.id, router.push)}
+                  onClick={(event) => openCustomerRow(event, customer.id, router.push, supportMode)}
+                  onKeyDown={(event) => openCustomerRowFromKeyboard(event, customer.id, router.push, supportMode)}
                   role="link"
                   tabIndex={0}
                 >
                   <td className="identity-cell customer-identity">
-                    <Link className="row-title-link" href={`/customers/${customer.id}`}>
+                    <Link className="row-title-link" href={scopedHref(`/customers/${customer.id}`, supportMode)}>
                       {customer.name}
                     </Link>
                     {address(customer) ? <span>{address(customer)}</span> : null}
@@ -1405,7 +1580,7 @@ function CustomersView({
                       </span>
                       <span>
                         <strong>{money(customer.lifetime_value_cents)}</strong>
-                        lifetime
+                        completed revenue
                       </span>
                     </div>
                   </td>
@@ -1438,6 +1613,7 @@ function CalendarView({
   onModeChange,
   onMove,
   onToday,
+  supportMode,
 }: {
   calendarDate: Date;
   jobs: Job[];
@@ -1446,6 +1622,7 @@ function CalendarView({
   onModeChange: (mode: CalendarMode) => void;
   onMove: (direction: number) => void;
   onToday: () => void;
+  supportMode: SupportMode;
 }) {
   const operationalJobs = jobs.filter((job) => job.scheduled_start && operationalStatuses.includes(job.status));
   const tentativeJobs = jobs.filter((job) => job.scheduled_start && job.status === "quoted");
@@ -1479,9 +1656,9 @@ function CalendarView({
       </div>
 
       <div className="calendar-range">{rangeLabel}</div>
-      {mode === "Week" ? <WeekCalendar date={calendarDate} jobs={operationalJobs} onCreateJob={onCreateJob} /> : null}
-      {mode === "Month" ? <MonthCalendar date={calendarDate} jobs={operationalJobs} /> : null}
-      {mode === "Agenda" ? <AgendaCalendar jobs={operationalJobs} /> : null}
+      {mode === "Week" ? <WeekCalendar date={calendarDate} jobs={operationalJobs} onCreateJob={onCreateJob} supportMode={supportMode} /> : null}
+      {mode === "Month" ? <MonthCalendar date={calendarDate} jobs={operationalJobs} supportMode={supportMode} /> : null}
+      {mode === "Agenda" ? <AgendaCalendar jobs={operationalJobs} supportMode={supportMode} /> : null}
 
       {tentativeJobs.length ? (
         <div className="tentative-list">
@@ -1489,7 +1666,7 @@ function CalendarView({
           <p className="muted">Quoted jobs with dates are listed separately until they are scheduled.</p>
           <div>
             {tentativeJobs.slice(0, 5).map((job) => (
-              <Link className="tentative-item" href={`/jobs/${job.id}`} key={job.id}>
+              <Link className="tentative-item" href={scopedHref(`/jobs/${job.id}`, supportMode)} key={job.id}>
                 <span>{dateLabel(job.scheduled_start)}</span>
                 <strong>{job.customer?.name ?? "Customer"}</strong>
                 <span>{job.title}</span>
@@ -1506,10 +1683,12 @@ function WeekCalendar({
   date,
   jobs,
   onCreateJob,
+  supportMode,
 }: {
   date: Date;
   jobs: Job[];
   onCreateJob: (scheduledStart?: Date) => void;
+  supportMode: SupportMode;
 }) {
   const first = startOfWeek(date);
   const days = Array.from({ length: 7 }, (_, index) => addDays(first, index));
@@ -1526,7 +1705,7 @@ function WeekCalendar({
             </button>
             <div className="day-events">
               {dayJobs.length ? (
-                dayJobs.map((job) => <CalendarEvent job={job} key={job.id} />)
+                dayJobs.map((job) => <CalendarEvent job={job} key={job.id} supportMode={supportMode} />)
               ) : (
                 <span className="no-events">Open</span>
               )}
@@ -1538,7 +1717,7 @@ function WeekCalendar({
   );
 }
 
-function MonthCalendar({ date, jobs }: { date: Date; jobs: Job[] }) {
+function MonthCalendar({ date, jobs, supportMode }: { date: Date; jobs: Job[]; supportMode: SupportMode }) {
   const firstOfMonth = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1));
   const first = startOfWeek(firstOfMonth);
   const days = Array.from({ length: 42 }, (_, index) => addDays(first, index));
@@ -1551,7 +1730,7 @@ function MonthCalendar({ date, jobs }: { date: Date; jobs: Job[] }) {
           <div className={day.getUTCMonth() === date.getUTCMonth() ? "month-day" : "month-day muted-day"} key={day.toISOString()}>
             <strong>{day.getUTCDate()}</strong>
             {dayJobs.slice(0, 2).map((job) => (
-              <CalendarEvent compact job={job} key={job.id} />
+              <CalendarEvent compact job={job} key={job.id} supportMode={supportMode} />
             ))}
             {dayJobs.length > 2 ? <span className="more-events">+{dayJobs.length - 2} more</span> : null}
           </div>
@@ -1561,7 +1740,7 @@ function MonthCalendar({ date, jobs }: { date: Date; jobs: Job[] }) {
   );
 }
 
-function AgendaCalendar({ jobs }: { jobs: Job[] }) {
+function AgendaCalendar({ jobs, supportMode }: { jobs: Job[]; supportMode: SupportMode }) {
   const groups = jobs
     .sort((a, b) => String(a.scheduled_start).localeCompare(String(b.scheduled_start)))
     .reduce<Record<string, Job[]>>((acc, job) => {
@@ -1586,7 +1765,7 @@ function AgendaCalendar({ jobs }: { jobs: Job[] }) {
         <section key={day}>
           <h3>{day}</h3>
           {dayJobs.map((job) => (
-            <CalendarEvent job={job} key={job.id} />
+            <CalendarEvent job={job} key={job.id} supportMode={supportMode} />
           ))}
         </section>
       ))}
@@ -1594,9 +1773,9 @@ function AgendaCalendar({ jobs }: { jobs: Job[] }) {
   );
 }
 
-function CalendarEvent({ compact = false, job }: { compact?: boolean; job: Job }) {
+function CalendarEvent({ compact = false, job, supportMode }: { compact?: boolean; job: Job; supportMode: SupportMode }) {
   return (
-    <Link className={compact ? `calendar-event compact status-${job.status}` : `calendar-event status-${job.status}`} href={`/jobs/${job.id}`}>
+    <Link className={compact ? `calendar-event compact status-${job.status}` : `calendar-event status-${job.status}`} href={scopedHref(`/jobs/${job.id}`, supportMode)}>
       <span>{timeLabel(job.scheduled_start)}</span>
       <strong>{job.customer?.name ?? "Customer"}</strong>
       <span>{job.title}</span>
@@ -1723,18 +1902,23 @@ function buildSourcePerformance(jobs: Job[]) {
 function SettingsView({
   business,
   dashboardWidgets,
+  followupSettings,
   intakeFields,
   pipelineStatuses,
   serviceTypes,
+  supportMode,
   terminology,
 }: {
   business: Business;
   dashboardWidgets: ReturnType<typeof normalizeDashboardWidgets>;
+  followupSettings: ReturnType<typeof normalizeFollowupSettings>;
   intakeFields: IntakeField[];
   pipelineStatuses: BusinessPipelineStatus[];
   serviceTypes: BusinessServiceType[];
+  supportMode: SupportMode;
   terminology: Terminology;
 }) {
+  const [settingsTab, setSettingsTab] = useState<"Workspace" | "Terminology" | "Services" | "Pipeline" | "Dashboard" | "Public intake">("Workspace");
   const intakePath = business.slug ? `/intake/${business.slug}` : "";
   const enabledFieldCount = intakeFields.filter((field) => field.enabled).length;
   const enabledServiceCount = serviceTypes.filter((service) => service.enabled).length;
@@ -1750,6 +1934,15 @@ function SettingsView({
 
   return (
     <div className="settings-stack">
+      <div className="settings-tabs" role="tablist" aria-label="Settings sections">
+        {(["Workspace", "Terminology", "Services", "Pipeline", "Dashboard", "Public intake"] as const).map((tab) => (
+          <button className={settingsTab === tab ? "active" : ""} key={tab} onClick={() => setSettingsTab(tab)} role="tab" type="button">
+            {tab}
+          </button>
+        ))}
+      </div>
+
+      {settingsTab === "Workspace" ? (
       <section className="data-panel settings-panel">
         <div className="panel-heading compact">
           <h2>Workspace settings</h2>
@@ -1757,6 +1950,7 @@ function SettingsView({
         </div>
         <form className="settings-form" action={updateBusiness}>
           <input type="hidden" name="businessId" value={business.id} />
+          <SupportModeInput supportMode={supportMode} />
           <div className="field">
             <label htmlFor="businessName">Business name</label>
             <input id="businessName" name="name" defaultValue={business.name} required />
@@ -1764,7 +1958,56 @@ function SettingsView({
           <SubmitButton>Save settings</SubmitButton>
         </form>
       </section>
+      ) : null}
 
+      {settingsTab === "Workspace" ? (
+      <section className="data-panel settings-panel">
+        <div className="panel-heading">
+          <div>
+            <h2>Follow-up automation</h2>
+            <p className="muted">Control when FlowDeck surfaces prospects, proposals, and quiet opportunities in Needs Attention.</p>
+          </div>
+          <span className={followupSettings.reminders_enabled ? "status-pill status-scheduled" : "status-pill"}>
+            {followupSettings.reminders_enabled ? "Enabled" : "Paused"}
+          </span>
+        </div>
+        <form className="settings-form" action={updateFollowupSettings}>
+          <input type="hidden" name="businessId" value={business.id} />
+          <SupportModeInput supportMode={supportMode} />
+          <label className="toggle-row">
+            <input name="remindersEnabled" type="checkbox" defaultChecked={followupSettings.reminders_enabled} />
+            <span>Show follow-up reminders in Needs Attention</span>
+          </label>
+          <div className="split-fields">
+            <div className="field">
+              <label htmlFor="new-lead-followup-hours">New prospect reminder after</label>
+              <input id="new-lead-followup-hours" name="newLeadFollowupHours" type="number" min="1" max="720" defaultValue={followupSettings.new_lead_followup_hours} required />
+              <p className="field-hint">Hours after a new lead arrives without first contact.</p>
+            </div>
+            <div className="field">
+              <label htmlFor="contacted-followup-days">Contacted follow-up after</label>
+              <input id="contacted-followup-days" name="contactedFollowupDays" type="number" min="1" max="365" defaultValue={followupSettings.contacted_followup_days} required />
+              <p className="field-hint">Days after first contact if no proposal or follow-up is set.</p>
+            </div>
+          </div>
+          <div className="split-fields">
+            <div className="field">
+              <label htmlFor="proposal-followup-days">{terminology.quote_singular} follow-up after</label>
+              <input id="proposal-followup-days" name="proposalFollowupDays" type="number" min="1" max="365" defaultValue={followupSettings.proposal_followup_days} required />
+              <p className="field-hint">Days after a sent {lowerTerm(terminology.quote_singular)} with no response.</p>
+            </div>
+            <div className="field">
+              <label htmlFor="stale-opportunity-days">Stale opportunity warning after</label>
+              <input id="stale-opportunity-days" name="staleOpportunityDays" type="number" min="1" max="365" defaultValue={followupSettings.stale_opportunity_days} required />
+              <p className="field-hint">Days without meaningful sales activity or a future follow-up.</p>
+            </div>
+          </div>
+          <SubmitButton>Save follow-up automation</SubmitButton>
+        </form>
+      </section>
+      ) : null}
+
+      {settingsTab === "Terminology" ? (
       <section className="data-panel settings-panel">
         <div className="panel-heading compact">
           <h2>Terminology</h2>
@@ -1772,6 +2015,7 @@ function SettingsView({
         </div>
         <form className="settings-form" action={updateTerminology}>
           <input type="hidden" name="businessId" value={business.id} />
+          <SupportModeInput supportMode={supportMode} />
           <div className="split-fields">
             <div className="field">
               <label htmlFor="term-job-singular">Work item singular</label>
@@ -1825,7 +2069,9 @@ function SettingsView({
           <SubmitButton>Save terminology</SubmitButton>
         </form>
       </section>
+      ) : null}
 
+      {settingsTab === "Services" ? (
       <section className="data-panel settings-panel">
         <div className="panel-heading">
           <div>
@@ -1849,6 +2095,7 @@ function SettingsView({
                   <form className="settings-form intake-field-form" action={updateServiceType}>
                     <input type="hidden" name="businessId" value={business.id} />
                     <input type="hidden" name="serviceId" value={service.id} />
+                    <SupportModeInput supportMode={supportMode} />
                     <div className="field">
                       <label htmlFor={`service-label-${service.key}`}>Display label</label>
                       <input id={`service-label-${service.key}`} name="label" defaultValue={service.label} maxLength={80} required />
@@ -1859,7 +2106,7 @@ function SettingsView({
                     </label>
                     <SubmitButton>Save service</SubmitButton>
                   </form>
-                  <ConfigMoveButtons businessId={business.id} configType="services" disabledDown={index === serviceTypes.length - 1} disabledUp={index === 0} itemId={service.id} />
+                  <ConfigMoveButtons businessId={business.id} configType="services" disabledDown={index === serviceTypes.length - 1} disabledUp={index === 0} itemId={service.id} supportMode={supportMode} />
                 </>
               ) : (
                 <p className="message">Run the workspace config migration to edit service settings.</p>
@@ -1871,6 +2118,7 @@ function SettingsView({
           <summary>Add service type</summary>
           <form className="settings-form intake-field-form" action={createServiceType}>
             <input type="hidden" name="businessId" value={business.id} />
+            <SupportModeInput supportMode={supportMode} />
             <div className="split-fields">
               <div className="field">
                 <label htmlFor="new-service-label">Display label</label>
@@ -1886,7 +2134,9 @@ function SettingsView({
           </form>
         </details>
       </section>
+      ) : null}
 
+      {settingsTab === "Pipeline" ? (
       <section className="data-panel settings-panel">
         <div className="panel-heading compact">
           <h2>Pipeline</h2>
@@ -1908,6 +2158,7 @@ function SettingsView({
                     <input type="hidden" name="businessId" value={business.id} />
                     <input type="hidden" name="statusId" value={status.id} />
                     <input type="hidden" name="semanticType" value={status.semantic_type} />
+                    <SupportModeInput supportMode={supportMode} />
                     <div className="field">
                       <label htmlFor={`pipeline-label-${status.semantic_type}`}>Display label</label>
                       <input id={`pipeline-label-${status.semantic_type}`} name="label" defaultValue={status.label} maxLength={80} required />
@@ -1923,7 +2174,7 @@ function SettingsView({
                     </label>
                     <SubmitButton>Save stage</SubmitButton>
                   </form>
-                  <ConfigMoveButtons businessId={business.id} configType="pipeline" disabledDown={index === pipelineStatuses.length - 1} disabledUp={index === 0} itemId={status.id} />
+                  <ConfigMoveButtons businessId={business.id} configType="pipeline" disabledDown={index === pipelineStatuses.length - 1} disabledUp={index === 0} itemId={status.id} supportMode={supportMode} />
                 </>
               ) : (
                 <p className="message">Run the workspace config migration to edit pipeline settings.</p>
@@ -1932,7 +2183,9 @@ function SettingsView({
           ))}
         </div>
       </section>
+      ) : null}
 
+      {settingsTab === "Dashboard" ? (
       <section className="data-panel settings-panel">
         <div className="panel-heading">
           <div>
@@ -1957,6 +2210,7 @@ function SettingsView({
                     <input type="hidden" name="businessId" value={business.id} />
                     <input type="hidden" name="widgetId" value={widget.id} />
                     <input type="hidden" name="widgetKey" value={widget.widget_key} />
+                    <SupportModeInput supportMode={supportMode} />
                     <div className="field">
                       <label htmlFor={`widget-label-${widget.widget_key}`}>Optional label override</label>
                       <input id={`widget-label-${widget.widget_key}`} name="labelOverride" defaultValue={widget.label_override ?? ""} maxLength={80} placeholder={dashboardWidgetRegistry[widget.widget_key].defaultLabel} />
@@ -1967,7 +2221,7 @@ function SettingsView({
                     </label>
                     <SubmitButton>Save dashboard item</SubmitButton>
                   </form>
-                  <ConfigMoveButtons businessId={business.id} configType="dashboard" disabledDown={index === dashboardWidgets.length - 1} disabledUp={index === 0} itemId={widget.id} />
+                  <ConfigMoveButtons businessId={business.id} configType="dashboard" disabledDown={index === dashboardWidgets.length - 1} disabledUp={index === 0} itemId={widget.id} supportMode={supportMode} />
                 </>
               ) : (
                 <p className="message">Run the workspace config migration to edit dashboard settings.</p>
@@ -1976,7 +2230,9 @@ function SettingsView({
           ))}
         </div>
       </section>
+      ) : null}
 
+      {settingsTab === "Public intake" ? (
       <section className="data-panel settings-panel">
         <div className="panel-heading">
           <div>
@@ -2007,6 +2263,7 @@ function SettingsView({
 
         <form className="settings-form" action={updateIntakeSettings}>
           <input type="hidden" name="businessId" value={business.id} />
+          <SupportModeInput supportMode={supportMode} />
           <label className="toggle-row">
             <input name="intakeEnabled" type="checkbox" defaultChecked={business.intake_form_enabled} />
             <span>Accept public submissions</span>
@@ -2022,7 +2279,9 @@ function SettingsView({
           <SubmitButton>Save intake form</SubmitButton>
         </form>
       </section>
+      ) : null}
 
+      {settingsTab === "Public intake" ? (
       <section className="data-panel settings-panel">
         <div className="panel-heading">
           <div>
@@ -2048,7 +2307,7 @@ function SettingsView({
                 </summary>
 
                 <form className="settings-form intake-field-form" action={updateIntakeField}>
-                  <IntakeFieldInputs businessId={business.id} field={field} />
+                  <IntakeFieldInputs businessId={business.id} field={field} supportMode={supportMode} />
                   <SubmitButton>Save field</SubmitButton>
                 </form>
 
@@ -2057,6 +2316,7 @@ function SettingsView({
                     <input type="hidden" name="businessId" value={business.id} />
                     <input type="hidden" name="fieldId" value={field.id} />
                     <input type="hidden" name="direction" value="up" />
+                    <SupportModeInput supportMode={supportMode} />
                     <button className="button button-secondary" disabled={index === 0} type="submit">
                       Move up
                     </button>
@@ -2065,6 +2325,7 @@ function SettingsView({
                     <input type="hidden" name="businessId" value={business.id} />
                     <input type="hidden" name="fieldId" value={field.id} />
                     <input type="hidden" name="direction" value="down" />
+                    <SupportModeInput supportMode={supportMode} />
                     <button className="button button-secondary" disabled={index === intakeFields.length - 1} type="submit">
                       Move down
                     </button>
@@ -2072,6 +2333,7 @@ function SettingsView({
                   <form action={archiveIntakeField}>
                     <input type="hidden" name="businessId" value={business.id} />
                     <input type="hidden" name="fieldId" value={field.id} />
+                    <SupportModeInput supportMode={supportMode} />
                     <button className="button button-secondary danger-button" disabled={!field.enabled} type="submit">
                       Disable
                     </button>
@@ -2090,20 +2352,22 @@ function SettingsView({
         <details className="intake-field-builder">
           <summary>Add custom field</summary>
           <form className="settings-form intake-field-form" action={createIntakeField}>
-            <IntakeFieldInputs businessId={business.id} />
+            <IntakeFieldInputs businessId={business.id} supportMode={supportMode} />
             <SubmitButton>Add field</SubmitButton>
           </form>
         </details>
       </section>
+      ) : null}
     </div>
   );
 }
 
-function IntakeFieldInputs({ businessId, field }: { businessId: string; field?: IntakeField }) {
+function IntakeFieldInputs({ businessId, field, supportMode }: { businessId: string; field?: IntakeField; supportMode: SupportMode }) {
   return (
     <>
       <input type="hidden" name="businessId" value={businessId} />
       {field ? <input type="hidden" name="fieldId" value={field.id} /> : null}
+      <SupportModeInput supportMode={supportMode} />
       <div className="split-fields">
         <div className="field">
           <label htmlFor={field ? `field-label-${field.id}` : "new-field-label"}>Label</label>
@@ -2170,12 +2434,14 @@ function ConfigMoveButtons({
   disabledDown,
   disabledUp,
   itemId,
+  supportMode,
 }: {
   businessId: string;
   configType: "services" | "pipeline" | "dashboard";
   disabledDown: boolean;
   disabledUp: boolean;
   itemId: string;
+  supportMode: SupportMode;
 }) {
   return (
     <div className="intake-field-actions">
@@ -2184,6 +2450,7 @@ function ConfigMoveButtons({
         <input type="hidden" name="configType" value={configType} />
         <input type="hidden" name="itemId" value={itemId} />
         <input type="hidden" name="direction" value="up" />
+        <SupportModeInput supportMode={supportMode} />
         <button className="button button-secondary" disabled={disabledUp} type="submit">
           Move up
         </button>
@@ -2193,6 +2460,7 @@ function ConfigMoveButtons({
         <input type="hidden" name="configType" value={configType} />
         <input type="hidden" name="itemId" value={itemId} />
         <input type="hidden" name="direction" value="down" />
+        <SupportModeInput supportMode={supportMode} />
         <button className="button button-secondary" disabled={disabledDown} type="submit">
           Move down
         </button>
@@ -2205,11 +2473,13 @@ function CustomerModal({
   businessId,
   customer,
   onClose,
+  supportBusinessId,
   terminology,
 }: {
   businessId: string;
   customer: CustomerSummary | null;
   onClose: () => void;
+  supportBusinessId: string | null;
   terminology: Terminology;
 }) {
   return (
@@ -2227,6 +2497,7 @@ function CustomerModal({
         <form className="modal-form" action={customer ? updateCustomer : createCustomer}>
           <input type="hidden" name="businessId" value={businessId} />
           {customer ? <input type="hidden" name="customerId" value={customer.id} /> : null}
+          {supportBusinessId ? <input type="hidden" name="adminBusinessId" value={supportBusinessId} /> : null}
           <CustomerFields customer={customer} terminology={terminology} />
           <div className="modal-actions">
             <button className="button button-secondary" onClick={onClose} type="button">
@@ -2265,6 +2536,7 @@ function JobModal({
   scheduledStart,
   serviceTypes,
   statusLabels,
+  supportBusinessId,
   terminology,
 }: {
   businessId: string;
@@ -2275,6 +2547,7 @@ function JobModal({
   scheduledStart?: Date;
   serviceTypes: BusinessServiceType[];
   statusLabels: Record<JobStatus, string>;
+  supportBusinessId: string | null;
   terminology: Terminology;
 }) {
   const start = job ? dateTimeValue(job.scheduled_start) : scheduledStart ? dateTimeValue(scheduledStart.toISOString()) : { date: "", time: "" };
@@ -2295,6 +2568,7 @@ function JobModal({
         <form className="modal-form" action={job ? updateJob : createJob}>
           <input type="hidden" name="businessId" value={businessId} />
           {job ? <input type="hidden" name="jobId" value={job.id} /> : null}
+          {supportBusinessId ? <input type="hidden" name="adminBusinessId" value={supportBusinessId} /> : null}
           <JobFields customers={customers} end={end} job={job} pipelineStatuses={pipelineStatuses} serviceTypes={serviceTypes} start={start} statusLabels={statusLabels} terminology={terminology} />
           <div className="modal-actions">
             <button className="button button-secondary" onClick={onClose} type="button">
@@ -2329,6 +2603,10 @@ export function CustomerFields({ customer, terminology = normalizeTerminology() 
         <label htmlFor="addressLine1">Address line 1</label>
         <input id="addressLine1" name="addressLine1" defaultValue={customer?.address_line1 ?? ""} placeholder="1200 Maple Street" />
       </div>
+      <div className="field">
+        <label htmlFor="addressLine2">Address line 2</label>
+        <input id="addressLine2" name="addressLine2" defaultValue={customer?.address_line2 ?? ""} placeholder="Suite, unit, building, or gate" />
+      </div>
       <div className="split-fields">
         <div className="field">
           <label htmlFor="city">City</label>
@@ -2337,6 +2615,10 @@ export function CustomerFields({ customer, terminology = normalizeTerminology() 
         <div className="field two-col">
           <label htmlFor="state">State</label>
           <input id="state" name="state" defaultValue={customer?.state ?? ""} placeholder="TX" />
+        </div>
+        <div className="field two-col">
+          <label htmlFor="postalCode">Postal code</label>
+          <input id="postalCode" name="postalCode" defaultValue={customer?.postal_code ?? ""} placeholder="78701" />
         </div>
       </div>
       <div className="field">
@@ -2367,15 +2649,18 @@ export function JobFields({
   terminology?: Terminology;
 }) {
   const enabledStatusOptions = job?.status === "lost" ? pipelineStatuses : pipelineStatuses.filter((status) => status.enabled && status.semantic_type !== "lost");
+  const currentServiceKey = serviceKey(job?.project_type, serviceTypes) ?? "";
+  const hasCurrentService = currentServiceKey ? serviceTypes.some((service) => service.key === currentServiceKey || service.label === job?.project_type) : true;
 
   return (
     <>
       <div className="field">
         <label htmlFor="customerId">{terminology.customer_singular}</label>
-        <select id="customerId" name="customerId" defaultValue={job?.customer_id ?? customers[0]?.id ?? ""} required>
+        <select id="customerId" name="customerId" defaultValue={job?.customer_id ?? customers[0]?.id ?? "__new__"} required={Boolean(job)}>
           <option value="" disabled>
             Select a {lowerTerm(terminology.customer_singular)}
           </option>
+          {!job ? <option value="__new__">Create a new {lowerTerm(terminology.customer_singular)} below</option> : null}
           {customers.map((customer) => (
             <option key={customer.id} value={customer.id}>
               {customer.name}
@@ -2383,9 +2668,52 @@ export function JobFields({
           ))}
         </select>
       </div>
+      {!job ? (
+        <details className="inline-new-customer">
+          <summary>Create a new {lowerTerm(terminology.customer_singular)} instead</summary>
+          <div className="split-fields">
+            <div className="field">
+              <label htmlFor="newCustomerName">New {lowerTerm(terminology.customer_singular)} name</label>
+              <input id="newCustomerName" name="newCustomerName" placeholder="Sarah Mitchell" />
+            </div>
+            <div className="field">
+              <label htmlFor="newCustomerPhone">Phone</label>
+              <input id="newCustomerPhone" name="newCustomerPhone" placeholder="(555) 123-0123" />
+            </div>
+          </div>
+          <div className="split-fields">
+            <div className="field">
+              <label htmlFor="newCustomerEmail">Email</label>
+              <input id="newCustomerEmail" name="newCustomerEmail" type="email" placeholder="customer@example.com" />
+            </div>
+            <div className="field">
+              <label htmlFor="newCustomerAddressLine1">Address line 1</label>
+              <input id="newCustomerAddressLine1" name="newCustomerAddressLine1" placeholder="1200 Maple Street" />
+            </div>
+          </div>
+          <div className="field">
+            <label htmlFor="newCustomerAddressLine2">Address line 2</label>
+            <input id="newCustomerAddressLine2" name="newCustomerAddressLine2" placeholder="Suite, unit, building, or gate" />
+          </div>
+          <div className="three-fields">
+            <div className="field">
+              <label htmlFor="newCustomerCity">City</label>
+              <input id="newCustomerCity" name="newCustomerCity" placeholder="Austin" />
+            </div>
+            <div className="field">
+              <label htmlFor="newCustomerState">State</label>
+              <input id="newCustomerState" name="newCustomerState" placeholder="TX" />
+            </div>
+            <div className="field">
+              <label htmlFor="newCustomerPostalCode">Postal code</label>
+              <input id="newCustomerPostalCode" name="newCustomerPostalCode" placeholder="78701" />
+            </div>
+          </div>
+        </details>
+      ) : null}
       <div className="field">
         <label htmlFor="title">{terminology.job_singular} title</label>
-        <input id="title" name="title" defaultValue={job?.title ?? ""} placeholder="Garage floor coating" required />
+        <input id="title" name="title" defaultValue={job?.title ?? ""} placeholder="Repair estimate" required />
       </div>
       <div className="field">
         <label htmlFor="description">Description</label>
@@ -2409,15 +2737,15 @@ export function JobFields({
       </div>
       <div className="field">
         <label htmlFor="projectType">Service type</label>
-        <select id="projectType" name="projectType" defaultValue={job?.project_type ?? ""}>
+        <select id="projectType" name="projectType" defaultValue={currentServiceKey}>
           <option value="">Not specified</option>
           {serviceTypes.map((service) => (
-            <option key={service.key} value={service.label}>
+            <option key={service.key} value={service.key}>
               {service.label}
             </option>
           ))}
-          {job?.project_type && !serviceTypes.some((service) => service.label === job.project_type) ? (
-            <option value={job.project_type}>{job.project_type}</option>
+          {job?.project_type && !hasCurrentService ? (
+            <option value={job.project_type}>{serviceLabel(job.project_type, serviceTypes)}</option>
           ) : null}
         </select>
       </div>

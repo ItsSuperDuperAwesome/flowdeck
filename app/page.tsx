@@ -25,7 +25,7 @@ export default async function Home({
     <main className="auth-page">
       <section className="auth-intro" aria-label="Product overview">
         <div className="brand-mark">JT</div>
-        <p className="eyebrow">Job Tracker</p>
+        <p className="eyebrow">FlowDeck</p>
         <h1>Run service jobs from quote to completion.</h1>
         <p>
           A focused workspace for small crews to track upcoming work, active installs,

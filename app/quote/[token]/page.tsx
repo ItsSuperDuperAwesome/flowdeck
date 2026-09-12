@@ -164,7 +164,7 @@ export default async function PublicQuotePage({
           ) : null}
         </section>
         <footer>
-          <Link href="/">Job Tracker</Link>
+          <Link href="/">FlowDeck</Link>
         </footer>
       </div>
     </main>

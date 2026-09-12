@@ -4,6 +4,7 @@ import { DashboardClient } from "@/app/dashboard/dashboard-client";
 import type {
   Business,
   BusinessDashboardWidget,
+  BusinessFollowupSettings,
   BusinessPipelineStatus,
   BusinessServiceType,
   BusinessTerminology,
@@ -12,6 +13,7 @@ import type {
   IntakeField,
   Job,
   JobActivity,
+  Quote,
   QuoteMessage,
 } from "@/lib/job-tracker/types";
 import { createClient } from "@/lib/supabase/server";
@@ -35,10 +37,12 @@ type QuoteMessageRow = QuoteMessage & {
 export default async function Dashboard({
   searchParams,
 }: {
-  searchParams: Promise<{ message?: string; view?: string }>;
+  searchParams: Promise<{ adminBusinessId?: string; filter?: string; message?: string; view?: string }>;
 }) {
   const params = await searchParams;
-  const initialView = isDashboardView(params.view) ? params.view : undefined;
+  const initialJobFilter = params.filter === "needs-attention" ? "needs-attention" : "all";
+  const initialView = dashboardViewFromParam(params.view) ?? (initialJobFilter === "needs-attention" ? "Jobs" : undefined);
+  const adminBusinessId = params.adminBusinessId;
 
   if (!hasSupabaseConfig()) {
     redirect("/");
@@ -53,12 +57,29 @@ export default async function Dashboard({
 
   const email = data.claims.email ?? "Signed-in user";
 
-  const { data: memberships, error: membershipError } = await supabase
-    .from("business_members")
-    .select("businesses(id, name, slug, intake_form_enabled, intake_form_title, intake_form_description)")
-    .limit(1);
+  const { data: adminCheck } = adminBusinessId ? await supabase.rpc("is_platform_admin") : { data: false };
+  const isAdminMode = Boolean(adminBusinessId && adminCheck);
 
-  const business = memberships?.[0]?.businesses as Business | null | undefined;
+  if (adminBusinessId && !isAdminMode) {
+    redirect("/dashboard");
+  }
+
+  const { data: memberships, error: membershipError } = isAdminMode
+    ? { data: null, error: null }
+    : await supabase
+        .from("business_members")
+        .select("businesses(id, name, slug, workspace_status, intake_form_enabled, intake_form_title, intake_form_description)")
+        .limit(1);
+
+  const { data: adminBusiness, error: adminBusinessError } = isAdminMode
+    ? await supabase
+        .from("businesses")
+        .select("id, name, slug, workspace_status, intake_form_enabled, intake_form_title, intake_form_description")
+        .eq("id", adminBusinessId)
+        .single()
+    : { data: null, error: null };
+
+  const business = isAdminMode ? (adminBusiness as Business | null | undefined) : (memberships?.[0]?.businesses as Business | null | undefined);
 
   const { data: customerRows, error: customersError } = business
     ? await supabase
@@ -87,7 +108,7 @@ export default async function Dashboard({
         .select("id, business_id, job_id, user_id, event_type, message, metadata, created_at, jobs(id, title, status)")
         .eq("business_id", business.id)
         .order("created_at", { ascending: false })
-        .limit(12)
+        .limit(100)
     : { data: [], error: null };
 
   const { data: intakeFieldRows, error: intakeFieldsError } = business
@@ -134,6 +155,22 @@ export default async function Dashboard({
         .maybeSingle()
     : { data: null, error: null };
 
+  const { data: followupSettingsRow, error: followupSettingsError } = business
+    ? await supabase
+        .from("business_followup_settings")
+        .select("business_id, new_lead_followup_hours, contacted_followup_days, proposal_followup_days, stale_opportunity_days, reminders_enabled, created_at, updated_at")
+        .eq("business_id", business.id)
+        .maybeSingle()
+    : { data: null, error: null };
+
+  const { data: quoteRows, error: quotesError } = business
+    ? await supabase
+        .from("quotes")
+        .select("id, business_id, job_id, amount_cents, notes, status, public_token, public_token_created_at, public_access_revoked_at, sent_at, accepted_at, declined_at, valid_until, created_at, updated_at")
+        .eq("business_id", business.id)
+        .order("created_at", { ascending: false })
+    : { data: [], error: null };
+
   const { data: quoteMessageRows, error: quoteMessagesError } = business
     ? await supabase
         .from("quote_messages")
@@ -157,7 +194,11 @@ export default async function Dashboard({
         serviceTypesError ||
         pipelineStatusesError ||
         dashboardWidgetsError ||
-        quoteMessagesError,
+        adminBusinessError ||
+        terminologyError ||
+        followupSettingsError ||
+        quoteMessagesError ||
+        quotesError,
     );
 
   const jobs: Job[] = ((jobRows ?? []) as unknown as JobRow[]).map((job) => ({
@@ -209,23 +250,27 @@ export default async function Dashboard({
       ) : business ? (
         <DashboardClient
           activities={activities}
+          adminMode={isAdminMode && business ? { businessId: business.id, businessName: business.name } : null}
           business={business}
           customers={customers}
           intakeFields={intakeFields}
           serviceTypes={(serviceTypeRows ?? []) as BusinessServiceType[]}
           pipelineStatuses={(pipelineStatusRows ?? []) as BusinessPipelineStatus[]}
           dashboardWidgets={(dashboardWidgetRows ?? []) as BusinessDashboardWidget[]}
+          followupSettings={(followupSettingsRow ?? null) as BusinessFollowupSettings | null}
           terminology={(terminologyRow ?? null) as BusinessTerminology | null}
           jobs={jobs}
+          initialJobFilter={initialJobFilter}
           initialView={initialView}
           message={params.message}
           quoteMessages={quoteMessages}
+          quotes={(quoteRows ?? []) as Quote[]}
           userEmail={email}
         />
       ) : (
         <section className="setup-shell">
           <div className="setup-panel">
-            <p className="eyebrow">Job Tracker</p>
+            <p className="eyebrow">FlowDeck</p>
             <h1>Create your workspace</h1>
             <p className="muted">
               Start with the business name. Customers, jobs, schedules, and activity
@@ -267,6 +312,22 @@ function buildCustomerSummaries(customers: Customer[], jobs: Job[]): CustomerSum
   });
 }
 
-function isDashboardView(value: string | undefined): value is "Overview" | "Pipeline" | "Jobs" | "Customers" | "Calendar" | "Analytics" | "Settings" {
-  return Boolean(value && ["Overview", "Pipeline", "Jobs", "Customers", "Calendar", "Analytics", "Settings"].includes(value));
+function dashboardViewFromParam(value: string | undefined): "Overview" | "Pipeline" | "Jobs" | "Customers" | "Calendar" | "Analytics" | "Settings" | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  const viewMap: Record<string, "Overview" | "Pipeline" | "Jobs" | "Customers" | "Calendar" | "Analytics" | "Settings"> = {
+    analytics: "Analytics",
+    calendar: "Calendar",
+    customers: "Customers",
+    jobs: "Jobs",
+    opportunities: "Jobs",
+    overview: "Overview",
+    pipeline: "Pipeline",
+    settings: "Settings",
+  };
+
+  return viewMap[normalized];
 }

@@ -12,9 +12,21 @@ import {
   setJobFollowUp,
   updateJob,
   updateJobStatus,
+  resolveQuoteMessage,
 } from "@/app/dashboard/actions";
-import { enabledPipelineStatuses, normalizeServiceTypes, normalizeTerminology, pipelineLabelMap, lowerTerm, type Terminology } from "@/lib/job-tracker/config";
+import { attentionLabel, buildAttentionIssues, type AttentionIssue } from "@/lib/job-tracker/attention";
+import {
+  enabledPipelineStatuses,
+  normalizeFollowupSettings,
+  normalizeServiceTypes,
+  normalizeTerminology,
+  pipelineLabelMap,
+  lowerTerm,
+  serviceLabel,
+  type Terminology,
+} from "@/lib/job-tracker/config";
 import type {
+  BusinessFollowupSettings,
   BusinessTerminology,
   BusinessPipelineStatus,
   BusinessServiceType,
@@ -41,6 +53,7 @@ type JobRow = Omit<Job, "customer"> & {
 };
 
 type ActivityRow = JobActivity;
+type SupportMode = { businessId: string; businessName: string } | null;
 
 const defaultStatusLabels: Record<JobStatus, string> = {
   lead: "Lead",
@@ -110,6 +123,49 @@ function moneyInputValue(cents: number) {
   return cents > 0 ? String(cents / 100) : "";
 }
 
+function scopedHref(href: string, supportMode: SupportMode) {
+  if (!supportMode || href.startsWith("#") || href.startsWith("tel:") || href.startsWith("mailto:") || href.startsWith("http")) {
+    return href;
+  }
+
+  const [beforeHash, hash = ""] = href.split("#");
+  if (beforeHash.includes("adminBusinessId=")) {
+    return href;
+  }
+
+  const separator = beforeHash.includes("?") ? "&" : "?";
+  const scoped = `${beforeHash}${separator}adminBusinessId=${encodeURIComponent(supportMode.businessId)}`;
+  return hash ? `${scoped}#${hash}` : scoped;
+}
+
+function SupportModeInput({ supportMode }: { supportMode: SupportMode }) {
+  return supportMode ? <input type="hidden" name="adminBusinessId" value={supportMode.businessId} /> : null;
+}
+
+function SupportModeBanner({ supportMode }: { supportMode: SupportMode }) {
+  return supportMode ? (
+    <div className="support-mode-banner">
+      <strong>Viewing {supportMode.businessName} as FlowDeck Admin</strong>
+      <Link href={`/admin/workspaces/${supportMode.businessId}`}>Exit admin view</Link>
+    </div>
+  ) : null;
+}
+
+function followUpState(value: string | null) {
+  if (!value) {
+    return null;
+  }
+
+  const diffMs = new Date(value).getTime() - Date.now();
+  const absDays = Math.max(0, Math.ceil(Math.abs(diffMs) / 86_400_000));
+
+  if (diffMs < 0) {
+    return absDays <= 1 ? "Due today" : `${absDays} days overdue`;
+  }
+
+  return absDays <= 1 ? "Due soon" : `Due in ${absDays} days`;
+}
+
 function dateLabel(value: string | null) {
   if (!value) {
     return "Unscheduled";
@@ -177,7 +233,7 @@ export default async function JobDetail({
   searchParams,
 }: {
   params: Promise<{ id: string }>;
-  searchParams: Promise<{ edit?: string; message?: string }>;
+  searchParams: Promise<{ adminBusinessId?: string; edit?: string; issue?: string; message?: string }>;
 }) {
   const { id } = await params;
   const query = await searchParams;
@@ -205,6 +261,27 @@ export default async function JobDetail({
       ? normalizedJob.customers[0] ?? null
       : normalizedJob.customers,
   };
+  let supportMode: SupportMode = null;
+
+  if (query.adminBusinessId) {
+    const { data: isPlatformAdmin } = await supabase.rpc("is_platform_admin");
+
+    if (isPlatformAdmin !== true || query.adminBusinessId !== job.business_id) {
+      redirect("/dashboard");
+    }
+
+    const { data: supportBusiness } = await supabase
+      .from("businesses")
+      .select("id, name")
+      .eq("id", query.adminBusinessId)
+      .maybeSingle();
+
+    if (!supportBusiness) {
+      redirect("/dashboard");
+    }
+
+    supportMode = { businessId: supportBusiness.id, businessName: supportBusiness.name };
+  }
 
   const { data: customerRows } = await supabase
     .from("customers")
@@ -238,11 +315,17 @@ export default async function JobDetail({
     .select("id, business_id, job_singular, job_plural, customer_singular, customer_plural, quote_singular, quote_plural, active_board_title, upcoming_title, new_job_button_label, new_customer_button_label, created_at, updated_at")
     .eq("business_id", job.business_id)
     .maybeSingle();
+  const { data: followupSettingsRow } = await supabase
+    .from("business_followup_settings")
+    .select("business_id, new_lead_followup_hours, contacted_followup_days, proposal_followup_days, stale_opportunity_days, reminders_enabled, created_at, updated_at")
+    .eq("business_id", job.business_id)
+    .maybeSingle();
   const serviceTypes = normalizeServiceTypes((serviceTypeRows ?? []) as BusinessServiceType[]);
   const pipelineConfig = (pipelineStatusRows ?? []) as BusinessPipelineStatus[];
   const pipelineStatuses = enabledPipelineStatuses(pipelineConfig);
   const statusLabels = pipelineConfig.length ? pipelineLabelMap(pipelineConfig) : defaultStatusLabels;
   const terminology = normalizeTerminology((terminologyRow ?? null) as BusinessTerminology | null);
+  const followupSettings = normalizeFollowupSettings((followupSettingsRow ?? null) as BusinessFollowupSettings | null);
 
   const { data: quoteRows } = await supabase
     .from("quotes")
@@ -289,22 +372,48 @@ export default async function JobDetail({
   const start = dateTimeValue(job.scheduled_start);
   const end = dateTimeValue(job.scheduled_end);
   const serviceAddress = job.job_address || address(job.customer) || "No service address yet";
+  const activity = (activityRows ?? []) as JobActivity[];
+  const attentionIssues = buildAttentionIssues({
+    activities: activity,
+    followupSettings,
+    jobs: [job],
+    quoteMessages: quoteMessages.map((quoteMessage) => ({ ...quoteMessage, job })),
+    quotes: quote ? [quote] : [],
+    terminology,
+  });
+  const focusedIssueId = query.issue ?? null;
+  const nextAction =
+    attentionIssues[0]?.action ??
+    (job.status === "completed"
+      ? "Completed. No follow-up reminder is active."
+      : job.status === "lost"
+        ? "Lost. No follow-up reminder is active."
+        : !followupSettings.reminders_enabled
+          ? "Follow-up reminders are paused for this workspace."
+          : "No immediate follow-up needed.");
+  const nextFollowUpLabel = job.next_follow_up_at
+    ? `${dateTimeLabel(job.next_follow_up_at)} · ${followUpState(job.next_follow_up_at)}`
+    : "Not set";
   const salesItems = [
+    { label: "Recommended next action", value: nextAction },
     { label: "First contact", value: optionalDateLabel(job.first_contact_at) },
     { label: `${terminology.quote_singular} status`, value: quote ? quoteStatusLabels[quote.status] : job.quote_sent_at ? `${terminology.quote_singular} sent` : `No ${lowerTerm(terminology.quote_singular)} yet` },
     { label: `${terminology.quote_singular} sent`, value: optionalDateLabel(quote?.sent_at ?? job.quote_sent_at) },
     { label: "Won", value: optionalDateLabel(job.won_at) },
-    { label: "Next follow-up", value: optionalDateLabel(job.next_follow_up_at) },
+    { label: "Next follow-up", value: nextFollowUpLabel },
+    { label: "Last sales activity", value: optionalDateLabel(activity[0]?.created_at ?? job.updated_at) },
     ...(job.completed_at ? [{ label: "Completed", value: optionalDateLabel(job.completed_at) }] : []),
     ...(job.revenue_cents > 0 ? [{ label: "Revenue", value: money(job.revenue_cents) }] : []),
     ...(job.status === "lost" ? [{ label: "Lost reason", value: job.lost_reason ? lostReasonLabels[job.lost_reason] ?? job.lost_reason : "Not recorded" }] : []),
   ];
 
   return (
+    <>
+    <SupportModeBanner supportMode={supportMode} />
     <main className="detail-shell">
       <div className="detail-header">
         <div>
-          <Link className="back-link" href="/dashboard">
+          <Link className="back-link" href={scopedHref("/dashboard", supportMode)}>
             Back to dashboard
           </Link>
           <p className="eyebrow">{terminology.job_singular}</p>
@@ -314,14 +423,16 @@ export default async function JobDetail({
           </p>
         </div>
         <div className="detail-header-actions">
-          <PrimaryJobAction job={job} terminology={terminology} />
-          <Link className="button button-secondary" href={`/jobs/${job.id}?edit=1#edit-job`}>
+          <PrimaryJobAction job={job} supportMode={supportMode} terminology={terminology} />
+          <Link className="button button-secondary" href={scopedHref(`/jobs/${job.id}?edit=1#edit-job`, supportMode)}>
             Edit {terminology.job_singular}
           </Link>
         </div>
       </div>
 
       {query.message ? <p className="success-message">{query.message}</p> : null}
+
+      <ActionRequiredPanel issues={attentionIssues} focusedIssueId={focusedIssueId} job={job} quote={quote} supportMode={supportMode} terminology={terminology} />
 
       <section className="detail-main">
         <section className="detail-top-grid">
@@ -331,7 +442,7 @@ export default async function JobDetail({
               <p className="muted">The key details needed to move this {lowerTerm(terminology.job_singular)} forward.</p>
             </div>
             <div className="info-grid info-grid-compact">
-              <Info label={terminology.customer_singular} value={job.customer?.name ?? `Unknown ${lowerTerm(terminology.customer_singular)}`} href={job.customer ? `/customers/${job.customer.id}` : undefined} />
+              <Info label={terminology.customer_singular} value={job.customer?.name ?? `Unknown ${lowerTerm(terminology.customer_singular)}`} href={job.customer ? scopedHref(`/customers/${job.customer.id}`, supportMode) : undefined} />
               <Info label="Phone" value={job.customer?.phone ?? "No phone"} href={job.customer?.phone ? `tel:${job.customer.phone}` : undefined} />
               <Info label="Email" value={job.customer?.email ?? "No email"} href={job.customer?.email ? `mailto:${job.customer.email}` : undefined} />
               <Info label="Service address" value={serviceAddress} />
@@ -350,7 +461,7 @@ export default async function JobDetail({
               {salesItems.map((item) => (
                 <Info key={item.label} label={item.label} value={item.value} />
               ))}
-              {job.project_type ? <Info label="Project type" value={job.project_type} /> : null}
+              {job.project_type ? <Info label="Service type" value={serviceLabel(job.project_type, serviceTypes)} /> : null}
               {job.preferred_date ? <Info label="Preferred date" value={dateLabel(job.preferred_date)} /> : null}
               {job.square_feet ? <Info label="Square footage" value={`${job.square_feet.toLocaleString()} sq ft`} /> : null}
               {job.budget_range ? <Info label="Budget range" value={job.budget_range} /> : null}
@@ -358,9 +469,9 @@ export default async function JobDetail({
           </section>
         </section>
 
-        <QuotePanel job={job} quote={quote} quoteMessages={quoteMessages} terminology={terminology} />
+        <QuotePanel job={job} quote={quote} quoteMessages={quoteMessages} supportMode={supportMode} terminology={terminology} />
 
-        <JobQuickActions job={job} terminology={terminology} />
+        <JobQuickActions job={job} supportMode={supportMode} terminology={terminology} />
 
         <IntakeResponsesPanel intakeData={job.intake_data} />
 
@@ -380,7 +491,7 @@ export default async function JobDetail({
           </section>
         </section>
 
-        <PhotoGallery files={files} jobId={job.id} terminology={terminology} />
+        <PhotoGallery files={files} jobId={job.id} supportMode={supportMode} terminology={terminology} />
 
           <section className="data-panel" id="activity">
             <div className="panel-heading compact">
@@ -410,6 +521,7 @@ export default async function JobDetail({
           </summary>
           <form className="settings-form" action={updateJob}>
             <input type="hidden" name="jobId" value={job.id} />
+          <SupportModeInput supportMode={supportMode} />
           <JobFields customers={customers} end={end} job={job} pipelineStatuses={pipelineStatuses} serviceTypes={serviceTypes} start={start} statusLabels={statusLabels} terminology={terminology} />
             <button className="button" type="submit">
               Save {lowerTerm(terminology.job_singular)}
@@ -418,6 +530,129 @@ export default async function JobDetail({
         </details>
       </section>
     </main>
+    </>
+  );
+}
+
+function ActionRequiredPanel({
+  focusedIssueId,
+  issues,
+  job,
+  quote,
+  supportMode,
+  terminology,
+}: {
+  focusedIssueId: string | null;
+  issues: AttentionIssue[];
+  job: Job;
+  quote: Quote | null;
+  supportMode: SupportMode;
+  terminology: Terminology;
+}) {
+  if (!issues.length) {
+    return null;
+  }
+
+  const orderedIssues = focusedIssueId
+    ? [...issues].sort((a, b) => Number(b.id === focusedIssueId) - Number(a.id === focusedIssueId) || a.priority - b.priority)
+    : issues;
+
+  return (
+    <section className="data-panel action-required-panel" id="action-required">
+      <div className="panel-heading compact">
+        <div>
+          <h2>Action Required</h2>
+          <p className="muted">Resolve the underlying state here and this warning will disappear everywhere.</p>
+        </div>
+        <span className="panel-count">{issues.length === 1 ? "1 issue" : `${issues.length} issues`}</span>
+      </div>
+
+      <div className="action-required-list">
+        {orderedIssues.map((issue) => (
+          <article className={`action-required-item attention-${issue.severity}${issue.id === focusedIssueId ? " focused" : ""}`} key={issue.id}>
+            <div className="action-required-copy">
+              <span className={`attention-severity ${issue.severity}`}>
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 2 2.8 19a2 2 0 0 0 1.8 3h14.8a2 2 0 0 0 1.8-3L12 2Zm1 15h-2v2h2v-2Zm0-7h-2v5h2v-5Z" />
+                </svg>
+                {attentionLabel(issue.severity)}
+              </span>
+              <div>
+                <strong>{issue.problem}</strong>
+                <p>{issue.why}</p>
+                <em>{issue.age} · {issue.action}</em>
+              </div>
+            </div>
+            <IssueActions issue={issue} job={job} quote={quote} supportMode={supportMode} terminology={terminology} />
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function IssueActions({ issue, job, quote, supportMode, terminology }: { issue: AttentionIssue; job: Job; quote: Quote | null; supportMode: SupportMode; terminology: Terminology }) {
+  const customer = job.customer;
+
+  return (
+    <div className="action-required-actions">
+      {issue.type === "new_lead" ? (
+        <form action={markJobContacted}>
+          <input type="hidden" name="jobId" value={job.id} />
+          <input type="hidden" name="returnTo" value={scopedHref(`/jobs/${job.id}`, supportMode)} />
+          <SupportModeInput supportMode={supportMode} />
+          <button className="button button-secondary" type="submit">
+            Mark Contacted
+          </button>
+        </form>
+      ) : null}
+
+      {issue.type === "follow_up_due" || issue.type === "follow_up_today" || issue.type === "contacted_follow_up" || issue.type === "proposal_awaiting_response" || issue.type === "stale_opportunity" ? (
+        <FollowUpForm jobId={job.id} supportMode={supportMode} />
+      ) : null}
+
+      {issue.type === "proposal_awaiting_response" && quote ? (
+        <a className="button button-secondary" href="#quote">
+          Review {terminology.quote_singular}
+        </a>
+      ) : null}
+
+      {issue.type === "customer_question" ? (
+        <>
+          <a className="button button-secondary" href="#quote">
+            Reply to Question
+          </a>
+          {issue.quoteMessage ? (
+            <form action={resolveQuoteMessage}>
+              <input type="hidden" name="messageId" value={issue.quoteMessage.id} />
+              <SupportModeInput supportMode={supportMode} />
+              <button className="button button-secondary" type="submit">
+                Mark Answered
+              </button>
+            </form>
+          ) : null}
+        </>
+      ) : null}
+
+      {issue.type === "unscheduled" || issue.type === "scheduled_no_date" || issue.type === "missing_address" ? (
+        <Link className="button button-secondary" href={scopedHref(`/jobs/${job.id}?edit=1#edit-job`, supportMode)}>
+          {issue.type === "missing_address" ? "Add Address" : `Schedule ${terminology.job_singular}`}
+        </Link>
+      ) : null}
+
+      {issue.type === "unscheduled" ? <LostForm jobId={job.id} supportMode={supportMode} /> : null}
+
+      {customer?.phone ? (
+        <a className="button button-secondary" href={`tel:${customer.phone}`}>
+          Call {terminology.customer_singular}
+        </a>
+      ) : null}
+      {customer?.email ? (
+        <a className="button button-secondary" href={`mailto:${customer.email}`}>
+          Email {terminology.customer_singular}
+        </a>
+      ) : null}
+    </div>
   );
 }
 
@@ -467,7 +702,7 @@ function formatIntakeResponse(response: IntakeResponse) {
   return response.value ?? "";
 }
 
-function PhotoGallery({ files, jobId, terminology }: { files: JobFile[]; jobId: string; terminology: Terminology }) {
+function PhotoGallery({ files, jobId, supportMode, terminology }: { files: JobFile[]; jobId: string; supportMode: SupportMode; terminology: Terminology }) {
   return (
     <section className="data-panel photo-panel">
       <div className="panel-heading compact">
@@ -478,14 +713,14 @@ function PhotoGallery({ files, jobId, terminology }: { files: JobFile[]; jobId: 
         <span className="panel-count">{files.length === 1 ? "1 photo" : `${files.length} photos`}</span>
       </div>
 
-      <PhotoUploadForm jobId={jobId} />
+      <PhotoUploadForm jobId={jobId} supportBusinessId={supportMode?.businessId ?? null} />
 
       {files.length ? (
         <div className="photo-grid">
           {files.map((file) => (
             <article className="photo-card" key={file.id}>
               {file.signed_url ? (
-                <Link href={`/jobs/${jobId}/photos/${file.id}`}>
+                <Link href={scopedHref(`/jobs/${jobId}/photos/${file.id}`, supportMode)}>
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img src={file.signed_url} alt={file.file_name} />
                 </Link>
@@ -511,11 +746,12 @@ function PhotoGallery({ files, jobId, terminology }: { files: JobFile[]; jobId: 
   );
 }
 
-function PrimaryJobAction({ job, terminology }: { job: Job; terminology: Terminology }) {
+function PrimaryJobAction({ job, supportMode, terminology }: { job: Job; supportMode: SupportMode; terminology: Terminology }) {
   if (job.status === "lead") {
     return (
       <form action={markJobContacted}>
         <input type="hidden" name="jobId" value={job.id} />
+        <SupportModeInput supportMode={supportMode} />
         <button className="button" type="submit">
           Mark Contacted
         </button>
@@ -527,8 +763,9 @@ function PrimaryJobAction({ job, terminology }: { job: Job; terminology: Termino
     return (
       <form action={updateJobStatus}>
         <input type="hidden" name="jobId" value={job.id} />
-        <input type="hidden" name="returnTo" value={`/jobs/${job.id}`} />
+        <input type="hidden" name="returnTo" value={scopedHref(`/jobs/${job.id}`, supportMode)} />
         <input type="hidden" name="status" value="in_progress" />
+        <SupportModeInput supportMode={supportMode} />
         <button className="button" type="submit">
           Start {terminology.job_singular}
         </button>
@@ -540,8 +777,9 @@ function PrimaryJobAction({ job, terminology }: { job: Job; terminology: Termino
     return (
       <form action={updateJobStatus}>
         <input type="hidden" name="jobId" value={job.id} />
-        <input type="hidden" name="returnTo" value={`/jobs/${job.id}`} />
+        <input type="hidden" name="returnTo" value={scopedHref(`/jobs/${job.id}`, supportMode)} />
         <input type="hidden" name="status" value="completed" />
+        <SupportModeInput supportMode={supportMode} />
         <button className="button" type="submit">
           Complete {terminology.job_singular}
         </button>
@@ -564,7 +802,7 @@ function PrimaryJobAction({ job, terminology }: { job: Job; terminology: Termino
   );
 }
 
-function QuotePanel({ job, quote, quoteMessages, terminology }: { job: Job; quote: Quote | null; quoteMessages: QuoteMessage[]; terminology: Terminology }) {
+function QuotePanel({ job, quote, quoteMessages, supportMode, terminology }: { job: Job; quote: Quote | null; quoteMessages: QuoteMessage[]; supportMode: SupportMode; terminology: Terminology }) {
   const isClosed = job.status === "completed" || job.status === "lost";
   const canSend = quote && quote.status === "draft";
   const canAccept = quote && quote.status !== "accepted" && quote.status !== "declined";
@@ -603,6 +841,7 @@ function QuotePanel({ job, quote, quoteMessages, terminology }: { job: Job; quot
         <form action={saveQuote} className="quote-form">
           <input type="hidden" name="jobId" value={job.id} />
           {quote ? <input type="hidden" name="quoteId" value={quote.id} /> : null}
+          <SupportModeInput supportMode={supportMode} />
           <div className="split-fields">
             <label>
               Amount
@@ -629,6 +868,7 @@ function QuotePanel({ job, quote, quoteMessages, terminology }: { job: Job; quot
             <form action={markQuoteSent}>
               <input type="hidden" name="jobId" value={job.id} />
               <input type="hidden" name="quoteId" value={quote.id} />
+              <SupportModeInput supportMode={supportMode} />
               <button className="button button-secondary" type="submit">
                 Mark Sent
               </button>
@@ -638,6 +878,7 @@ function QuotePanel({ job, quote, quoteMessages, terminology }: { job: Job; quot
             <form action={markQuoteAccepted}>
               <input type="hidden" name="jobId" value={job.id} />
               <input type="hidden" name="quoteId" value={quote.id} />
+              <SupportModeInput supportMode={supportMode} />
               <button className="button button-secondary" type="submit">
                 Mark Accepted
               </button>
@@ -647,6 +888,7 @@ function QuotePanel({ job, quote, quoteMessages, terminology }: { job: Job; quot
             <form action={markQuoteDeclined}>
               <input type="hidden" name="jobId" value={job.id} />
               <input type="hidden" name="quoteId" value={quote.id} />
+              <SupportModeInput supportMode={supportMode} />
               <button className="button button-secondary" type="submit">
                 Mark Declined
               </button>
@@ -692,6 +934,7 @@ function QuotePanel({ job, quote, quoteMessages, terminology }: { job: Job; quot
       {quote ? (
         <form action={sendQuoteReply} className="quote-reply-form">
           <input type="hidden" name="quoteId" value={quote.id} />
+          <SupportModeInput supportMode={supportMode} />
           <label>
             Reply to {lowerTerm(terminology.customer_singular)}
             <textarea name="reply" maxLength={1000} placeholder={`Write a short reply about this ${lowerTerm(terminology.quote_singular)}.`} rows={3} required />
@@ -720,7 +963,7 @@ function Info({ href, label, value }: { href?: string; label: string; value: str
   );
 }
 
-function JobQuickActions({ job, terminology }: { job: Job; terminology: Terminology }) {
+function JobQuickActions({ job, supportMode, terminology }: { job: Job; supportMode: SupportMode; terminology: Terminology }) {
   if (job.status === "completed" || job.status === "lost") {
     return null;
   }
@@ -747,33 +990,35 @@ function JobQuickActions({ job, terminology }: { job: Job; terminology: Terminol
           <>
             <form action={markJobContacted}>
               <input type="hidden" name="jobId" value={job.id} />
+              <SupportModeInput supportMode={supportMode} />
               <button className="button button-secondary" type="submit">
                 Mark Contacted
               </button>
             </form>
-            <FollowUpForm jobId={job.id} />
-            <LostForm jobId={job.id} />
+            <FollowUpForm jobId={job.id} supportMode={supportMode} />
+            <LostForm jobId={job.id} supportMode={supportMode} />
           </>
         ) : null}
 
         {job.status === "contacted" || job.status === "quoted" ? (
           <>
-            <FollowUpForm jobId={job.id} />
-            <Link className="button button-secondary" href={`/jobs/${job.id}?edit=1#edit-job`}>
+            <FollowUpForm jobId={job.id} supportMode={supportMode} />
+            <Link className="button button-secondary" href={scopedHref(`/jobs/${job.id}?edit=1#edit-job`, supportMode)}>
               Schedule
             </Link>
-            <Link className="button button-secondary" href={`/jobs/${job.id}?edit=1#edit-job`}>
+            <Link className="button button-secondary" href={scopedHref(`/jobs/${job.id}?edit=1#edit-job`, supportMode)}>
               Add Note
             </Link>
-            <LostForm jobId={job.id} />
+            <LostForm jobId={job.id} supportMode={supportMode} />
           </>
         ) : null}
 
         {job.status === "scheduled" ? (
           <form action={updateJobStatus}>
             <input type="hidden" name="jobId" value={job.id} />
-            <input type="hidden" name="returnTo" value={`/jobs/${job.id}`} />
+            <input type="hidden" name="returnTo" value={scopedHref(`/jobs/${job.id}`, supportMode)} />
             <input type="hidden" name="status" value="in_progress" />
+            <SupportModeInput supportMode={supportMode} />
             <button className="button" type="submit">
               Start {terminology.job_singular}
             </button>
@@ -783,8 +1028,9 @@ function JobQuickActions({ job, terminology }: { job: Job; terminology: Terminol
         {job.status === "in_progress" ? (
           <form action={updateJobStatus}>
             <input type="hidden" name="jobId" value={job.id} />
-            <input type="hidden" name="returnTo" value={`/jobs/${job.id}`} />
+            <input type="hidden" name="returnTo" value={scopedHref(`/jobs/${job.id}`, supportMode)} />
             <input type="hidden" name="status" value="completed" />
+            <SupportModeInput supportMode={supportMode} />
             <button className="button" type="submit">
               Complete {terminology.job_singular}
             </button>
@@ -811,10 +1057,11 @@ function terminologyActivityMessage(message: string, terminology: Terminology) {
     .replace(/\bjobs\b/g, lowerTerm(terminology.job_plural));
 }
 
-function FollowUpForm({ jobId }: { jobId: string }) {
+function FollowUpForm({ jobId, supportMode }: { jobId: string; supportMode: SupportMode }) {
   return (
     <form action={setJobFollowUp} className="quick-action-form">
       <input type="hidden" name="jobId" value={jobId} />
+      <SupportModeInput supportMode={supportMode} />
       <label>
         Follow-up
         <input name="nextFollowUpAt" type="datetime-local" required />
@@ -826,10 +1073,11 @@ function FollowUpForm({ jobId }: { jobId: string }) {
   );
 }
 
-function LostForm({ jobId }: { jobId: string }) {
+function LostForm({ jobId, supportMode }: { jobId: string; supportMode: SupportMode }) {
   return (
     <form action={markJobLost} className="quick-action-form">
       <input type="hidden" name="jobId" value={jobId} />
+      <SupportModeInput supportMode={supportMode} />
       <label>
         Lost reason
         <select name="lostReason" required defaultValue="">

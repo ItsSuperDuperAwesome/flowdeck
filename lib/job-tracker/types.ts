@@ -35,6 +35,7 @@ export type Business = {
   intake_form_enabled: boolean;
   intake_form_title: string;
   intake_form_description: string;
+  workspace_status?: "active" | "trial" | "paused";
 };
 
 export type Customer = {
@@ -128,6 +129,17 @@ export type BusinessDashboardWidget = {
   label_override: string | null;
   enabled: boolean;
   sort_order: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type BusinessFollowupSettings = {
+  business_id: string;
+  new_lead_followup_hours: number;
+  contacted_followup_days: number;
+  proposal_followup_days: number;
+  stale_opportunity_days: number;
+  reminders_enabled: boolean;
   created_at: string;
   updated_at: string;
 };

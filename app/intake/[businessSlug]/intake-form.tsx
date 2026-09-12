@@ -9,7 +9,7 @@ type IntakeFormProps = {
   businessSlug: string;
   customFields: IntakeField[];
   description: string;
-  serviceTypes: string[];
+  serviceTypes: Array<{ key: string; label: string }>;
   terminology?: Terminology;
   title: string;
 };
@@ -102,8 +102,8 @@ export function IntakeForm({ businessName, businessSlug, customFields, descripti
           <select id="serviceType" name="serviceType" required>
             <option value="">Select one</option>
             {serviceTypes.map((type) => (
-              <option key={type} value={type}>
-                {type}
+              <option key={type.key} value={type.key}>
+                {type.label}
               </option>
             ))}
           </select>

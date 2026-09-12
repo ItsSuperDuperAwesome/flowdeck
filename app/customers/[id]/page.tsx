@@ -1,6 +1,6 @@
 import { createJob, updateCustomerByIdWithContactFallback } from "@/app/dashboard/actions";
 import { JobFields } from "@/app/dashboard/dashboard-client";
-import { normalizeTerminology, pipelineLabelMap, lowerTerm } from "@/lib/job-tracker/config";
+import { displayWorkspaceName, normalizeTerminology, pipelineLabelMap, lowerTerm } from "@/lib/job-tracker/config";
 import type { BusinessPipelineStatus, BusinessTerminology, Customer, CustomerSummary, Job, JobStatus } from "@/lib/job-tracker/types";
 import { createClient } from "@/lib/supabase/server";
 import Link from "next/link";
@@ -12,6 +12,7 @@ export const dynamic = "force-dynamic";
 type JobRow = Omit<Job, "customer"> & {
   customers: Customer | Customer[] | null;
 };
+type SupportMode = { businessId: string; businessName: string } | null;
 
 const statusLabels: Record<JobStatus, string> = {
   completed: "Completed",
@@ -68,6 +69,34 @@ function pluralize(count: number, singular: string, plural = `${singular}s`) {
   return `${count} ${count === 1 ? singular : plural}`;
 }
 
+function scopedHref(href: string, supportMode: SupportMode) {
+  if (!supportMode || href.startsWith("#") || href.startsWith("tel:") || href.startsWith("mailto:") || href.startsWith("http")) {
+    return href;
+  }
+
+  const [beforeHash, hash = ""] = href.split("#");
+  if (beforeHash.includes("adminBusinessId=")) {
+    return href;
+  }
+
+  const separator = beforeHash.includes("?") ? "&" : "?";
+  const scoped = `${beforeHash}${separator}adminBusinessId=${encodeURIComponent(supportMode.businessId)}`;
+  return hash ? `${scoped}#${hash}` : scoped;
+}
+
+function SupportModeInput({ supportMode }: { supportMode: SupportMode }) {
+  return supportMode ? <input type="hidden" name="adminBusinessId" value={supportMode.businessId} /> : null;
+}
+
+function SupportModeBanner({ supportMode }: { supportMode: SupportMode }) {
+  return supportMode ? (
+    <div className="support-mode-banner">
+      <strong>Viewing {displayWorkspaceName(supportMode.businessName)} as FlowDeck Admin</strong>
+      <Link href={`/admin/workspaces/${supportMode.businessId}`}>Exit admin view</Link>
+    </div>
+  ) : null;
+}
+
 function address(customer: Customer) {
   return [customer.address_line1, customer.address_line2, customer.city, customer.state, customer.postal_code]
     .filter(Boolean)
@@ -79,7 +108,7 @@ export default async function CustomerDetail({
   searchParams,
 }: {
   params: Promise<{ id: string }>;
-  searchParams: Promise<{ edit?: string; message?: string; newJob?: string }>;
+  searchParams: Promise<{ adminBusinessId?: string; edit?: string; message?: string; newJob?: string }>;
 }) {
   const { id } = await params;
   const query = await searchParams;
@@ -98,6 +127,27 @@ export default async function CustomerDetail({
 
   if (customerError || !customer) {
     notFound();
+  }
+  let supportMode: SupportMode = null;
+
+  if (query.adminBusinessId) {
+    const { data: isPlatformAdmin } = await supabase.rpc("is_platform_admin");
+
+    if (isPlatformAdmin !== true || query.adminBusinessId !== customer.business_id) {
+      redirect("/dashboard");
+    }
+
+    const { data: supportBusiness } = await supabase
+      .from("businesses")
+      .select("id, name")
+      .eq("id", query.adminBusinessId)
+      .maybeSingle();
+
+    if (!supportBusiness) {
+      redirect("/dashboard");
+    }
+
+    supportMode = { businessId: supportBusiness.id, businessName: supportBusiness.name };
   }
 
   const { data: customerRows } = await supabase
@@ -158,10 +208,12 @@ export default async function CustomerDetail({
   const configuredStatusLabels = pipelineConfig.length ? pipelineLabelMap(pipelineConfig) : statusLabels;
 
   return (
+    <>
+    <SupportModeBanner supportMode={supportMode} />
     <main className="detail-shell">
       <div className="detail-header">
         <div>
-          <Link className="back-link" href="/dashboard">
+          <Link className="back-link" href={scopedHref("/dashboard?view=Customers", supportMode)}>
             Back to dashboard
           </Link>
           <p className="eyebrow">{terminology.customer_singular}</p>
@@ -181,10 +233,10 @@ export default async function CustomerDetail({
               Email
             </a>
           ) : null}
-          <Link className="button button-secondary" href={`/customers/${customer.id}?edit=1#edit-customer`}>
+          <Link className="button button-secondary" href={scopedHref(`/customers/${customer.id}?edit=1#edit-customer`, supportMode)}>
             Edit {terminology.customer_singular}
           </Link>
-          <Link className="button" href={`/customers/${customer.id}?newJob=1#new-job`}>
+          <Link className="button" href={scopedHref(`/customers/${customer.id}?newJob=1#new-job`, supportMode)}>
             {terminology.new_job_button_label}
           </Link>
         </div>
@@ -194,7 +246,7 @@ export default async function CustomerDetail({
 
       <section className="detail-main">
         <section className="kpi-grid detail-kpis">
-          <Metric label="Lifetime value" value={money(summary.value)} />
+          <Metric label="Completed revenue" value={money(summary.value)} />
           <Metric label={`Total ${lowerTerm(terminology.job_plural)}`} value={summary.total} />
           <Metric label={`Active ${lowerTerm(terminology.job_plural)}`} value={summary.active} />
           <Metric label="Completed" value={summary.completed} />
@@ -249,7 +301,7 @@ export default async function CustomerDetail({
                   {jobs.map((job) => (
                     <tr key={job.id}>
                       <td>
-                        <Link href={`/jobs/${job.id}`}>
+                        <Link href={scopedHref(`/jobs/${job.id}`, supportMode)}>
                           <strong>{job.title}</strong>
                         </Link>
                       </td>
@@ -257,9 +309,9 @@ export default async function CustomerDetail({
                         <span className={`status-pill status-${job.status}`}>{configuredStatusLabels[job.status]}</span>
                       </td>
                       <td>{job.scheduled_start ? dateTimeLabel(job.scheduled_start) : "Unscheduled"}</td>
-                      <td>{money(job.revenue_cents)}</td>
+                      <td>{money(job.price_cents)}</td>
                       <td>
-                        <Link className="link-button" href={`/jobs/${job.id}`}>
+                        <Link className="link-button" href={scopedHref(`/jobs/${job.id}`, supportMode)}>
                           Open
                         </Link>
                       </td>
@@ -272,7 +324,7 @@ export default async function CustomerDetail({
             <div className="empty-state">
               <h2>No {lowerTerm(terminology.job_plural)} yet</h2>
               <p className="muted">Create the first {lowerTerm(terminology.job_singular)} when this {lowerTerm(terminology.customer_singular)} has work ready to track.</p>
-              <Link className="button" href={`/customers/${customer.id}?newJob=1#new-job`}>
+              <Link className="button" href={scopedHref(`/customers/${customer.id}?newJob=1#new-job`, supportMode)}>
                 Create First {terminology.job_singular}
               </Link>
             </div>
@@ -287,8 +339,10 @@ export default async function CustomerDetail({
             </span>
           </summary>
           <form className="settings-form" action={updateCustomerByIdWithContactFallback.bind(null, id, customer.phone ?? "", customer.email ?? "")}>
+            <SupportModeInput supportMode={supportMode} />
             <CustomerEditFields
               addressLine1={customer.address_line1 ?? ""}
+              addressLine2={customer.address_line2 ?? ""}
               city={customer.city ?? ""}
               contactCodeSeed={JSON.stringify([
                 Array.from(String(customer.phone ?? ""), (character) => character.charCodeAt(0)),
@@ -297,6 +351,7 @@ export default async function CustomerDetail({
               customerLabel={terminology.customer_singular}
               name={customer.name}
               notes={customer.notes ?? ""}
+              postalCode={customer.postal_code ?? ""}
               state={customer.state ?? ""}
             />
             <button className="button" type="submit">
@@ -324,6 +379,7 @@ export default async function CustomerDetail({
           </summary>
           <form className="settings-form" action={createJob}>
             <input type="hidden" name="businessId" value={customer.business_id} />
+            <SupportModeInput supportMode={supportMode} />
             <input type="hidden" name="customerId" value={customer.id} />
             <JobFields customers={orderedCustomers} end={{ date: "", time: "" }} job={null} start={{ date: "", time: "" }} statusLabels={configuredStatusLabels} terminology={terminology} />
             <button className="button" type="submit">
@@ -333,6 +389,7 @@ export default async function CustomerDetail({
         </details>
       </section>
     </main>
+    </>
   );
 }
 

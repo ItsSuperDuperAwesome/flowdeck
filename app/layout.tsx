@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Job Tracker",
+  title: "FlowDeck",
   description: "A service-business job tracker with Supabase auth",
 };
 

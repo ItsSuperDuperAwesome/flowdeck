@@ -120,11 +120,12 @@ insert into public.business_service_types (business_id, key, label, sort_order)
 select businesses.id, defaults.key, defaults.label, defaults.sort_order
 from public.businesses
 cross join (values
-  ('garage_floor', 'Garage floor', 10),
-  ('patio', 'Patio', 20),
-  ('commercial_floor', 'Commercial floor', 30),
-  ('basement', 'Basement', 40),
-  ('other', 'Other', 50)
+  ('site_visit', 'Site visit', 10),
+  ('new_install', 'New installation', 20),
+  ('repair', 'Repair', 30),
+  ('maintenance', 'Maintenance', 40),
+  ('consultation', 'Consultation', 50),
+  ('other', 'Other', 60)
 ) as defaults(key, label, sort_order)
 on conflict (business_id, key) do nothing;
 

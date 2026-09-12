@@ -11,10 +11,38 @@ type PhotoPreviewPageProps = {
     fileId: string;
     id: string;
   }>;
+  searchParams: Promise<{ adminBusinessId?: string }>;
 };
 
-export default async function PhotoPreviewPage({ params }: PhotoPreviewPageProps) {
+type SupportMode = { businessId: string; businessName: string } | null;
+
+function scopedHref(href: string, supportMode: SupportMode) {
+  if (!supportMode || href.startsWith("#") || href.startsWith("tel:") || href.startsWith("mailto:") || href.startsWith("http")) {
+    return href;
+  }
+
+  const [beforeHash, hash = ""] = href.split("#");
+  if (beforeHash.includes("adminBusinessId=")) {
+    return href;
+  }
+
+  const separator = beforeHash.includes("?") ? "&" : "?";
+  const scoped = `${beforeHash}${separator}adminBusinessId=${encodeURIComponent(supportMode.businessId)}`;
+  return hash ? `${scoped}#${hash}` : scoped;
+}
+
+function SupportModeBanner({ supportMode }: { supportMode: SupportMode }) {
+  return supportMode ? (
+    <div className="support-mode-banner">
+      <strong>Viewing {supportMode.businessName} as FlowDeck Admin</strong>
+      <Link href={`/admin/workspaces/${supportMode.businessId}`}>Exit admin view</Link>
+    </div>
+  ) : null;
+}
+
+export default async function PhotoPreviewPage({ params, searchParams }: PhotoPreviewPageProps) {
   const { fileId, id } = await params;
+  const query = await searchParams;
   const supabase = await createClient();
   const { data: photo } = await supabase
     .from("job_files")
@@ -28,6 +56,28 @@ export default async function PhotoPreviewPage({ params }: PhotoPreviewPageProps
   }
 
   const { data: job } = await supabase.from("jobs").select("business_id").eq("id", id).maybeSingle();
+  let supportMode: SupportMode = null;
+
+  if (query.adminBusinessId) {
+    const { data: isPlatformAdmin } = await supabase.rpc("is_platform_admin");
+
+    if (isPlatformAdmin !== true || query.adminBusinessId !== job?.business_id) {
+      notFound();
+    }
+
+    const { data: supportBusiness } = await supabase
+      .from("businesses")
+      .select("id, name")
+      .eq("id", query.adminBusinessId)
+      .maybeSingle();
+
+    if (!supportBusiness) {
+      notFound();
+    }
+
+    supportMode = { businessId: supportBusiness.id, businessName: supportBusiness.name };
+  }
+
   const { data: terminologyRow } = job?.business_id
     ? await supabase.from("business_terminology").select("*").eq("business_id", job.business_id).maybeSingle()
     : { data: null };
@@ -36,10 +86,12 @@ export default async function PhotoPreviewPage({ params }: PhotoPreviewPageProps
   const { data: signed } = await supabase.storage.from(photo.storage_bucket).createSignedUrl(photo.storage_path, 60 * 15);
 
   return (
+    <>
+    <SupportModeBanner supportMode={supportMode} />
     <main className="detail-shell photo-preview-page">
       <div className="detail-header">
         <div>
-          <Link className="back-link" href={`/jobs/${id}`}>
+          <Link className="back-link" href={scopedHref(`/jobs/${id}`, supportMode)}>
             Back to {lowerTerm(terminology.job_singular)}
           </Link>
           <p className="eyebrow">Photo</p>
@@ -64,6 +116,7 @@ export default async function PhotoPreviewPage({ params }: PhotoPreviewPageProps
         )}
       </section>
     </main>
+    </>
   );
 }
 

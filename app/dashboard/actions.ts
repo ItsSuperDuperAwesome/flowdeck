@@ -1,6 +1,13 @@
 "use server";
 
-import { dashboardWidgetRegistry, defaultDashboardWidgets, defaultPipelineStatuses, defaultServiceTypes, defaultTerminology } from "@/lib/job-tracker/config";
+import {
+  dashboardWidgetRegistry,
+  defaultDashboardWidgets,
+  defaultFollowupSettings,
+  defaultPipelineStatuses,
+  defaultServiceTypes,
+  defaultTerminology,
+} from "@/lib/job-tracker/config";
 import type { DashboardWidgetKey, IntakeFieldType, JobFileCategory, JobSource, JobStatus, QuoteStatus } from "@/lib/job-tracker/types";
 import { createClient } from "@/lib/supabase/server";
 import { randomBytes } from "crypto";
@@ -36,6 +43,23 @@ function message(value: string) {
   return encodeURIComponent(value);
 }
 
+function scopedRedirectPath(formData: FormData, href: string) {
+  const adminBusinessId = clean(formData.get("adminBusinessId"));
+
+  if (!adminBusinessId || !href.startsWith("/") || href.startsWith("//") || href.includes("://")) {
+    return href;
+  }
+
+  const [beforeHash, hash = ""] = href.split("#");
+  if (beforeHash.includes("adminBusinessId=")) {
+    return href;
+  }
+
+  const separator = beforeHash.includes("?") ? "&" : "?";
+  const scoped = `${beforeHash}${separator}adminBusinessId=${encodeURIComponent(adminBusinessId)}`;
+  return hash ? `${scoped}#${hash}` : scoped;
+}
+
 function clean(value: FormDataEntryValue | null) {
   return String(value ?? "").trim();
 }
@@ -43,6 +67,11 @@ function clean(value: FormDataEntryValue | null) {
 function optional(value: FormDataEntryValue | null) {
   const cleaned = clean(value);
   return cleaned || null;
+}
+
+function boundedInteger(value: FormDataEntryValue | null, fallback: number, min: number, max: number) {
+  const number = Number(clean(value));
+  return Number.isFinite(number) ? Math.min(max, Math.max(min, Math.round(number))) : fallback;
 }
 
 function internalRedirectTarget(value: FormDataEntryValue | null, fallback: string) {
@@ -316,11 +345,37 @@ async function requireBusinessAccess(businessId: string) {
     .limit(1)
     .single();
 
-  if (error || !data?.business_id) {
-    redirect(`/dashboard?view=Settings&message=${message("Could not access that workspace.")}`);
+  if (!error && data?.business_id) {
+    return { businessId: data.business_id as string, isPlatformAdmin: false, supabase, userId };
   }
 
-  return { businessId: data.business_id as string, supabase, userId };
+  const { data: isPlatformAdmin } = await supabase.rpc("is_platform_admin");
+
+  if (isPlatformAdmin === true) {
+    return { businessId, isPlatformAdmin: true, supabase, userId };
+  }
+
+  redirect(`/dashboard?view=Settings&message=${message("Could not access that workspace.")}`);
+}
+
+async function logPlatformAdminConfigChange(input: {
+  action: string;
+  businessId: string;
+  entityType: string;
+  isPlatformAdmin: boolean;
+  metadata?: Record<string, unknown>;
+  supabase: Awaited<ReturnType<typeof createClient>>;
+}) {
+  if (!input.isPlatformAdmin) {
+    return;
+  }
+
+  await input.supabase.rpc("platform_admin_log", {
+    action: input.action,
+    entity_type: input.entityType,
+    metadata: input.metadata ?? {},
+    target_business_id: input.businessId,
+  });
 }
 
 function fieldKeyFromLabel(label: string) {
@@ -371,6 +426,11 @@ async function seedWorkspaceConfig(supabase: Awaited<ReturnType<typeof createCli
     job_singular: defaultTerminology.job_singular,
     quote_plural: defaultTerminology.quote_plural,
     quote_singular: defaultTerminology.quote_singular,
+  });
+
+  await supabase.from("business_followup_settings").upsert({
+    ...defaultFollowupSettings,
+    business_id: businessId,
   });
 }
 
@@ -536,7 +596,7 @@ export async function createCustomer(formData: FormData) {
   }
 
   revalidatePath("/dashboard");
-  redirect(`/customers/${data.id}?message=${message("Customer created.")}`);
+  redirect(scopedRedirectPath(formData, `/customers/${data.id}?message=${message("Customer created.")}`));
 }
 
 export async function updateCustomer(formData: FormData) {
@@ -590,12 +650,13 @@ async function updateCustomerRecord(
 
   revalidatePath("/dashboard");
   revalidatePath(`/customers/${customerId}`);
-  redirect(`/customers/${customerId}?message=${message("Customer updated.")}`);
+  redirect(scopedRedirectPath(formData, `/customers/${customerId}?message=${message("Customer updated.")}`));
 }
 
 export async function createJob(formData: FormData) {
   const businessId = clean(formData.get("businessId")) || (await requireBusinessId());
-  const customerId = clean(formData.get("customerId"));
+  const submittedCustomerId = clean(formData.get("customerId"));
+  const customerId = submittedCustomerId === "__new__" ? "" : submittedCustomerId;
   const title = clean(formData.get("title"));
   const status = clean(formData.get("status")) as JobStatus;
   const scheduledStart = scheduleValue(formData.get("scheduledDate"), formData.get("scheduledTime"));
@@ -603,8 +664,9 @@ export async function createJob(formData: FormData) {
   const scheduledEnd = normalizeScheduledEnd(scheduledStart, submittedEnd);
   const source = (clean(formData.get("source")) || "manual") as JobSource;
   const projectType = optional(formData.get("projectType"));
+  const newCustomerName = clean(formData.get("newCustomerName"));
 
-  if (!businessId || !customerId || !title) {
+  if (!businessId || (!customerId && !newCustomerName) || !title) {
     redirect(`/dashboard?message=${message("Customer and job title are required.")}`);
   }
 
@@ -625,12 +687,55 @@ export async function createJob(formData: FormData) {
   }
 
   const { supabase, userId } = await requireUser();
-  const { data: customer } = await supabase
-    .from("customers")
-    .select("name, address_line1, address_line2, city, state, postal_code")
-    .eq("id", customerId)
-    .eq("business_id", businessId)
-    .single();
+  let resolvedCustomerId = customerId;
+  let customer:
+    | {
+        name: string;
+        address_line1: string | null;
+        address_line2: string | null;
+        city: string | null;
+        state: string | null;
+        postal_code: string | null;
+      }
+    | null = null;
+
+  if (newCustomerName) {
+    const { data: newCustomer, error: newCustomerError } = await supabase
+      .from("customers")
+      .insert({
+        address_line1: optional(formData.get("newCustomerAddressLine1")),
+        address_line2: optional(formData.get("newCustomerAddressLine2")),
+        business_id: businessId,
+        city: optional(formData.get("newCustomerCity")),
+        email: optional(formData.get("newCustomerEmail")),
+        name: newCustomerName,
+        phone: optional(formData.get("newCustomerPhone")),
+        postal_code: optional(formData.get("newCustomerPostalCode")),
+        state: optional(formData.get("newCustomerState")),
+      })
+      .select("id, name, address_line1, address_line2, city, state, postal_code")
+      .single();
+
+    if (newCustomerError || !newCustomer) {
+      redirect(`/dashboard?message=${message(newCustomerError?.message ?? "Could not create that customer.")}`);
+    }
+
+    resolvedCustomerId = newCustomer.id;
+    customer = newCustomer;
+  } else {
+    const { data: existingCustomer, error: existingCustomerError } = await supabase
+      .from("customers")
+      .select("name, address_line1, address_line2, city, state, postal_code")
+      .eq("id", customerId)
+      .eq("business_id", businessId)
+      .single();
+
+    if (existingCustomerError || !existingCustomer) {
+      redirect(`/dashboard?message=${message("Choose an existing customer or create a new one.")}`);
+    }
+
+    customer = existingCustomer ?? null;
+  }
 
   const customerAddress = [
     customer?.address_line1,
@@ -656,8 +761,8 @@ export async function createJob(formData: FormData) {
     .from("jobs")
     .insert({
       business_id: businessId,
-      customer_id: customerId,
-      customer_name: customer?.name ?? "Customer",
+      customer_id: resolvedCustomerId,
+      customer_name: customer?.name ?? newCustomerName ?? "Customer",
       description: optional(formData.get("description")),
       internal_notes: optional(formData.get("internalNotes")),
       job_address: address,
@@ -699,7 +804,7 @@ export async function createJob(formData: FormData) {
   }
 
   revalidatePath("/dashboard");
-  redirect(`/jobs/${job.id}?message=${message("Job created.")}`);
+  redirect(scopedRedirectPath(formData, `/jobs/${job.id}?message=${message("Job created.")}`));
 }
 
 export async function updateJob(formData: FormData) {
@@ -856,7 +961,7 @@ export async function updateJob(formData: FormData) {
 
   revalidatePath("/dashboard");
   revalidatePath(`/jobs/${jobId}`);
-  redirect(`/jobs/${jobId}?message=${message("Job updated.")}`);
+  redirect(scopedRedirectPath(formData, `/jobs/${jobId}?message=${message("Job updated.")}`));
 }
 
 export async function updateJobStatus(formData: FormData) {
@@ -918,7 +1023,7 @@ export async function updateJobStatus(formData: FormData) {
 
   revalidatePath("/dashboard");
   revalidatePath(`/jobs/${jobId}`);
-  redirect(clean(formData.get("returnTo")) || "/dashboard");
+  redirect(scopedRedirectPath(formData, clean(formData.get("returnTo")) || "/dashboard"));
 }
 
 export async function markJobContacted(formData: FormData) {
@@ -928,7 +1033,7 @@ export async function markJobContacted(formData: FormData) {
     redirect(`/dashboard?message=${message("Could not find that job.")}`);
   }
 
-  const returnTo = internalRedirectTarget(formData.get("returnTo"), `/jobs/${jobId}?message=${message("Contact recorded.")}`);
+  const returnTo = internalRedirectTarget(formData.get("returnTo"), scopedRedirectPath(formData, `/jobs/${jobId}?message=${message("Contact recorded.")}`));
 
   const { supabase, userId } = await requireUser();
   const { data: current, error: currentError } = await supabase
@@ -973,7 +1078,7 @@ export async function markJobContacted(formData: FormData) {
 
   revalidatePath("/dashboard");
   revalidatePath(`/jobs/${jobId}`);
-  redirect(returnTo);
+  redirect(scopedRedirectPath(formData, returnTo));
 }
 
 export async function markJobQuoted(formData: FormData) {
@@ -1025,7 +1130,7 @@ export async function markJobQuoted(formData: FormData) {
 
   revalidatePath("/dashboard");
   revalidatePath(`/jobs/${jobId}`);
-  redirect(`/jobs/${jobId}?message=${message("Quote recorded.")}`);
+  redirect(scopedRedirectPath(formData, `/jobs/${jobId}?message=${message("Quote recorded.")}`));
 }
 
 export async function setJobFollowUp(formData: FormData) {
@@ -1071,7 +1176,7 @@ export async function setJobFollowUp(formData: FormData) {
 
   revalidatePath("/dashboard");
   revalidatePath(`/jobs/${jobId}`);
-  redirect(`/jobs/${jobId}?message=${message("Follow-up saved.")}`);
+  redirect(scopedRedirectPath(formData, `/jobs/${jobId}?message=${message("Follow-up saved.")}`));
 }
 
 export async function markJobLost(formData: FormData) {
@@ -1123,7 +1228,7 @@ export async function markJobLost(formData: FormData) {
 
   revalidatePath("/dashboard");
   revalidatePath(`/jobs/${jobId}`);
-  redirect(`/jobs/${jobId}?message=${message("Job marked lost.")}`);
+  redirect(scopedRedirectPath(formData, `/jobs/${jobId}?message=${message("Job marked lost.")}`));
 }
 
 export async function saveQuote(formData: FormData) {
@@ -1202,7 +1307,7 @@ export async function saveQuote(formData: FormData) {
 
   revalidatePath("/dashboard");
   revalidatePath(`/jobs/${jobId}`);
-  redirect(`/jobs/${jobId}?message=${message("Quote saved.")}`);
+  redirect(scopedRedirectPath(formData, `/jobs/${jobId}?message=${message("Quote saved.")}`));
 }
 
 export async function markQuoteSent(formData: FormData) {
@@ -1268,7 +1373,7 @@ export async function markQuoteSent(formData: FormData) {
 
   revalidatePath("/dashboard");
   revalidatePath(`/jobs/${jobId}`);
-  redirect(`/jobs/${jobId}?message=${message("Quote marked sent.")}`);
+  redirect(scopedRedirectPath(formData, `/jobs/${jobId}?message=${message("Quote marked sent.")}`));
 }
 
 export async function markQuoteAccepted(formData: FormData) {
@@ -1343,7 +1448,7 @@ export async function markQuoteAccepted(formData: FormData) {
 
   revalidatePath("/dashboard");
   revalidatePath(`/jobs/${jobId}`);
-  redirect(`/jobs/${jobId}?message=${message("Quote accepted.")}`);
+  redirect(scopedRedirectPath(formData, `/jobs/${jobId}?message=${message("Quote accepted.")}`));
 }
 
 export async function markQuoteDeclined(formData: FormData) {
@@ -1397,7 +1502,7 @@ export async function markQuoteDeclined(formData: FormData) {
 
   revalidatePath("/dashboard");
   revalidatePath(`/jobs/${jobId}`);
-  redirect(`/jobs/${jobId}?message=${message("Quote declined.")}`);
+  redirect(scopedRedirectPath(formData, `/jobs/${jobId}?message=${message("Quote declined.")}`));
 }
 
 export async function resolveQuoteMessage(formData: FormData) {
@@ -1442,7 +1547,7 @@ export async function resolveQuoteMessage(formData: FormData) {
 
   revalidatePath("/dashboard");
   revalidatePath(`/jobs/${quoteMessage.job_id}`);
-  redirect(`/jobs/${quoteMessage.job_id}?message=${message("Quote question resolved.")}#quote`);
+  redirect(scopedRedirectPath(formData, `/jobs/${quoteMessage.job_id}?message=${message("Quote question resolved.")}#quote`));
 }
 
 export async function sendQuoteReply(formData: FormData) {
@@ -1520,7 +1625,7 @@ export async function sendQuoteReply(formData: FormData) {
   revalidatePath("/dashboard");
   revalidatePath(`/jobs/${quote.job_id}`);
   revalidatePath(`/quote/${quote.public_token}`);
-  redirect(`/jobs/${quote.job_id}?message=${message(existingReply ? "Reply already sent." : "Reply sent.")}#quote`);
+  redirect(scopedRedirectPath(formData, `/jobs/${quote.job_id}?message=${message(existingReply ? "Reply already sent." : "Reply sent.")}#quote`));
 }
 
 export async function uploadJobPhotos(formData: FormData) {
@@ -1601,7 +1706,7 @@ export async function uploadJobPhotos(formData: FormData) {
 
   revalidatePath("/dashboard");
   revalidatePath(`/jobs/${jobId}`);
-  redirect(`/jobs/${jobId}?message=${message(uploadedCount === 1 ? "Photo uploaded." : "Photos uploaded.")}`);
+  redirect(scopedRedirectPath(formData, `/jobs/${jobId}?message=${message(uploadedCount === 1 ? "Photo uploaded." : "Photos uploaded.")}`));
 }
 
 export async function updateBusiness(formData: FormData) {
@@ -1620,7 +1725,64 @@ export async function updateBusiness(formData: FormData) {
   }
 
   revalidatePath("/dashboard");
-  redirect(`/dashboard?message=${message("Workspace updated.")}`);
+  redirect(scopedRedirectPath(formData, `/dashboard?message=${message("Workspace updated.")}`));
+}
+
+export async function updateFollowupSettings(formData: FormData) {
+  const businessId = clean(formData.get("businessId"));
+
+  if (!businessId) {
+    redirect(`/dashboard?view=Settings&message=${message("Could not find that workspace.")}`);
+  }
+
+  const payload = {
+    contacted_followup_days: boundedInteger(
+      formData.get("contactedFollowupDays"),
+      defaultFollowupSettings.contacted_followup_days,
+      1,
+      365,
+    ),
+    new_lead_followup_hours: boundedInteger(
+      formData.get("newLeadFollowupHours"),
+      defaultFollowupSettings.new_lead_followup_hours,
+      1,
+      720,
+    ),
+    proposal_followup_days: boundedInteger(
+      formData.get("proposalFollowupDays"),
+      defaultFollowupSettings.proposal_followup_days,
+      1,
+      365,
+    ),
+    reminders_enabled: formData.get("remindersEnabled") === "on",
+    stale_opportunity_days: boundedInteger(
+      formData.get("staleOpportunityDays"),
+      defaultFollowupSettings.stale_opportunity_days,
+      1,
+      365,
+    ),
+  };
+
+  const { businessId: authorizedBusinessId, isPlatformAdmin, supabase } = await requireBusinessAccess(businessId);
+  const { error } = await supabase
+    .from("business_followup_settings")
+    .upsert({ business_id: authorizedBusinessId, ...payload }, { onConflict: "business_id" });
+
+  if (error) {
+    redirect(`/dashboard?view=Settings&message=${message(error.message)}`);
+  }
+
+  await logPlatformAdminConfigChange({
+    action: "update_followup_settings",
+    businessId: authorizedBusinessId,
+    entityType: "business_followup_settings",
+    isPlatformAdmin,
+    metadata: payload,
+    supabase,
+  });
+
+  revalidatePath("/dashboard");
+  redirect(scopedRedirectPath(formData, `/dashboard?view=Settings&message=${message("Follow-up automation saved.")}`));
 }
 
 export async function updateTerminology(formData: FormData) {
@@ -1659,7 +1821,7 @@ export async function updateTerminology(formData: FormData) {
   }
 
   revalidatePath("/dashboard");
-  redirect(`/dashboard?view=Settings&message=${message("Terminology saved.")}`);
+  redirect(scopedRedirectPath(formData, `/dashboard?view=Settings&message=${message("Terminology saved.")}`));
 }
 
 export async function updateIntakeSettings(formData: FormData) {
@@ -1686,7 +1848,7 @@ export async function updateIntakeSettings(formData: FormData) {
   }
 
   revalidatePath("/dashboard");
-  redirect(`/dashboard?message=${message("Intake form settings saved.")}`);
+  redirect(scopedRedirectPath(formData, `/dashboard?view=Settings&message=${message("Intake form settings saved.")}`));
 }
 
 export async function createIntakeField(formData: FormData) {
@@ -1721,7 +1883,7 @@ export async function createIntakeField(formData: FormData) {
   }
 
   revalidatePath("/dashboard");
-  redirect(`/dashboard?view=Settings&message=${message("Intake field added.")}`);
+  redirect(scopedRedirectPath(formData, `/dashboard?view=Settings&message=${message("Intake field added.")}`));
 }
 
 export async function updateIntakeField(formData: FormData) {
@@ -1750,7 +1912,7 @@ export async function updateIntakeField(formData: FormData) {
   }
 
   revalidatePath("/dashboard");
-  redirect(`/dashboard?view=Settings&message=${message("Intake field saved.")}`);
+  redirect(scopedRedirectPath(formData, `/dashboard?view=Settings&message=${message("Intake field saved.")}`));
 }
 
 export async function archiveIntakeField(formData: FormData) {
@@ -1773,7 +1935,7 @@ export async function archiveIntakeField(formData: FormData) {
   }
 
   revalidatePath("/dashboard");
-  redirect(`/dashboard?view=Settings&message=${message("Intake field disabled.")}`);
+  redirect(scopedRedirectPath(formData, `/dashboard?view=Settings&message=${message("Intake field disabled.")}`));
 }
 
 export async function moveIntakeField(formData: FormData) {
@@ -1801,7 +1963,7 @@ export async function moveIntakeField(formData: FormData) {
   const targetIndex = direction === "up" ? currentIndex - 1 : currentIndex + 1;
 
   if (currentIndex < 0 || targetIndex < 0 || targetIndex >= fields.length) {
-    redirect(`/dashboard?view=Settings`);
+    redirect(scopedRedirectPath(formData, `/dashboard?view=Settings`));
   }
 
   const current = fields[currentIndex];
@@ -1827,7 +1989,7 @@ export async function moveIntakeField(formData: FormData) {
   }
 
   revalidatePath("/dashboard");
-  redirect(`/dashboard?view=Settings`);
+  redirect(scopedRedirectPath(formData, `/dashboard?view=Settings`));
 }
 
 export async function createServiceType(formData: FormData) {
@@ -1865,7 +2027,7 @@ export async function createServiceType(formData: FormData) {
   }
 
   revalidatePath("/dashboard");
-  redirect(`/dashboard?view=Settings&message=${message("Service type added.")}`);
+  redirect(scopedRedirectPath(formData, `/dashboard?view=Settings&message=${message("Service type added.")}`));
 }
 
 export async function updateServiceType(formData: FormData) {
@@ -1889,7 +2051,7 @@ export async function updateServiceType(formData: FormData) {
   }
 
   revalidatePath("/dashboard");
-  redirect(`/dashboard?view=Settings&message=${message("Service type saved.")}`);
+  redirect(scopedRedirectPath(formData, `/dashboard?view=Settings&message=${message("Service type saved.")}`));
 }
 
 export async function archiveServiceType(formData: FormData) {
@@ -1912,7 +2074,7 @@ export async function archiveServiceType(formData: FormData) {
   }
 
   revalidatePath("/dashboard");
-  redirect(`/dashboard?view=Settings&message=${message("Service type disabled.")}`);
+  redirect(scopedRedirectPath(formData, `/dashboard?view=Settings&message=${message("Service type disabled.")}`));
 }
 
 export async function updatePipelineStatusConfig(formData: FormData) {
@@ -1939,7 +2101,7 @@ export async function updatePipelineStatusConfig(formData: FormData) {
   }
 
   revalidatePath("/dashboard");
-  redirect(`/dashboard?view=Settings&message=${message("Pipeline status saved.")}`);
+  redirect(scopedRedirectPath(formData, `/dashboard?view=Settings&message=${message("Pipeline status saved.")}`));
 }
 
 export async function updateDashboardWidgetConfig(formData: FormData) {
@@ -1968,7 +2130,7 @@ export async function updateDashboardWidgetConfig(formData: FormData) {
   }
 
   revalidatePath("/dashboard");
-  redirect(`/dashboard?view=Settings&message=${message("Dashboard item saved.")}`);
+  redirect(scopedRedirectPath(formData, `/dashboard?view=Settings&message=${message("Dashboard item saved.")}`));
 }
 
 export async function moveConfigItem(formData: FormData) {
@@ -2006,7 +2168,7 @@ export async function moveConfigItem(formData: FormData) {
   const targetIndex = direction === "up" ? currentIndex - 1 : currentIndex + 1;
 
   if (currentIndex < 0 || targetIndex < 0 || targetIndex >= items.length) {
-    redirect(`/dashboard?view=Settings`);
+    redirect(scopedRedirectPath(formData, `/dashboard?view=Settings`));
   }
 
   const current = items[currentIndex];
@@ -2032,5 +2194,5 @@ export async function moveConfigItem(formData: FormData) {
   }
 
   revalidatePath("/dashboard");
-  redirect(`/dashboard?view=Settings`);
+  redirect(scopedRedirectPath(formData, `/dashboard?view=Settings`));
 }
