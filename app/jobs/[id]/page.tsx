@@ -1,6 +1,7 @@
 import { JobFields } from "@/app/dashboard/dashboard-client";
 import { PhotoUploadForm } from "@/app/jobs/[id]/photo-upload-form";
 import { QuoteShareLink } from "@/app/jobs/[id]/quote-share-link";
+import { ToastMessage } from "@/app/toast-message";
 import {
   markJobContacted,
   markJobLost,
@@ -25,7 +26,11 @@ import {
   serviceLabel,
   type Terminology,
 } from "@/lib/job-tracker/config";
+import { completedRevenueCents, opportunityValueCents, wonValueCents } from "@/lib/job-tracker/money";
+import { successFeedbackMessage } from "@/lib/job-tracker/feedback";
+import { actionTypeLabels, resolvePlaybookForJob } from "@/lib/job-tracker/playbooks";
 import type {
+  BusinessActionPlaybook,
   BusinessFollowupSettings,
   BusinessTerminology,
   BusinessPipelineStatus,
@@ -237,6 +242,7 @@ export default async function JobDetail({
 }) {
   const { id } = await params;
   const query = await searchParams;
+  const toastMessage = successFeedbackMessage(query.message);
   const supabase = await createClient();
   const { data: auth, error: authError } = await supabase.auth.getClaims();
 
@@ -320,12 +326,20 @@ export default async function JobDetail({
     .select("business_id, new_lead_followup_hours, contacted_followup_days, proposal_followup_days, stale_opportunity_days, reminders_enabled, created_at, updated_at")
     .eq("business_id", job.business_id)
     .maybeSingle();
+  const { data: actionPlaybookRows } = await supabase
+    .from("business_action_playbooks")
+    .select("id, business_id, service_type_id, pipeline_status_id, pipeline_key, action_key, action_label, action_type, is_enabled, sort_order, created_at, updated_at")
+    .eq("business_id", job.business_id)
+    .eq("pipeline_key", job.status)
+    .order("sort_order", { ascending: true })
+    .order("created_at", { ascending: true });
   const serviceTypes = normalizeServiceTypes((serviceTypeRows ?? []) as BusinessServiceType[]);
   const pipelineConfig = (pipelineStatusRows ?? []) as BusinessPipelineStatus[];
   const pipelineStatuses = enabledPipelineStatuses(pipelineConfig);
   const statusLabels = pipelineConfig.length ? pipelineLabelMap(pipelineConfig) : defaultStatusLabels;
   const terminology = normalizeTerminology((terminologyRow ?? null) as BusinessTerminology | null);
   const followupSettings = normalizeFollowupSettings((followupSettingsRow ?? null) as BusinessFollowupSettings | null);
+  const playbook = resolvePlaybookForJob(job, (actionPlaybookRows ?? []) as BusinessActionPlaybook[], serviceTypes);
 
   const { data: quoteRows } = await supabase
     .from("quotes")
@@ -351,6 +365,7 @@ export default async function JobDetail({
     .from("job_activity")
     .select("id, business_id, job_id, user_id, event_type, message, metadata, created_at")
     .eq("job_id", id)
+    .eq("business_id", job.business_id)
     .order("created_at", { ascending: false });
 
   const { data: fileRows } = await supabase
@@ -403,7 +418,8 @@ export default async function JobDetail({
     { label: "Next follow-up", value: nextFollowUpLabel },
     { label: "Last sales activity", value: optionalDateLabel(activity[0]?.created_at ?? job.updated_at) },
     ...(job.completed_at ? [{ label: "Completed", value: optionalDateLabel(job.completed_at) }] : []),
-    ...(job.revenue_cents > 0 ? [{ label: "Revenue", value: money(job.revenue_cents) }] : []),
+    ...(wonValueCents(job) > 0 ? [{ label: "Won value", value: money(wonValueCents(job)) }] : []),
+    ...(completedRevenueCents(job) > 0 ? [{ label: "Completed revenue", value: money(completedRevenueCents(job)) }] : []),
     ...(job.status === "lost" ? [{ label: "Lost reason", value: job.lost_reason ? lostReasonLabels[job.lost_reason] ?? job.lost_reason : "Not recorded" }] : []),
   ];
 
@@ -419,7 +435,7 @@ export default async function JobDetail({
           <p className="eyebrow">{terminology.job_singular}</p>
           <h1>{job.title}</h1>
           <p className="muted">
-            {job.customer?.name ?? "Unknown customer"} | {statusLabels[job.status]} | {money(job.price_cents)}
+            {job.customer?.name ?? "Unknown customer"} | {statusLabels[job.status]} | {money(opportunityValueCents(job))}
           </p>
         </div>
         <div className="detail-header-actions">
@@ -430,9 +446,11 @@ export default async function JobDetail({
         </div>
       </div>
 
-      {query.message ? <p className="success-message">{query.message}</p> : null}
+      {toastMessage ? <ToastMessage message={toastMessage} /> : null}
+      {query.message && !toastMessage ? <p className="success-message">{query.message}</p> : null}
 
       <ActionRequiredPanel issues={attentionIssues} focusedIssueId={focusedIssueId} job={job} quote={quote} supportMode={supportMode} terminology={terminology} />
+      <RecommendedActionsPanel job={job} playbook={playbook} quote={quote} supportMode={supportMode} terminology={terminology} />
 
       <section className="detail-main">
         <section className="detail-top-grid">
@@ -447,7 +465,7 @@ export default async function JobDetail({
               <Info label="Email" value={job.customer?.email ?? "No email"} href={job.customer?.email ? `mailto:${job.customer.email}` : undefined} />
               <Info label="Service address" value={serviceAddress} />
               <Info label="Schedule" value={job.scheduled_start ? dateTimeLabel(job.scheduled_start) : "Unscheduled"} />
-              <Info label="Value" value={money(job.price_cents)} />
+              <Info label="Opportunity value" value={money(opportunityValueCents(job))} />
               <Info label="Lead source" value={sourceLabels[job.source]} />
             </div>
           </section>
@@ -656,6 +674,108 @@ function IssueActions({ issue, job, quote, supportMode, terminology }: { issue: 
   );
 }
 
+function RecommendedActionsPanel({
+  job,
+  playbook,
+  quote,
+  supportMode,
+  terminology,
+}: {
+  job: Job;
+  playbook: ReturnType<typeof resolvePlaybookForJob>;
+  quote: Quote | null;
+  supportMode: SupportMode;
+  terminology: Terminology;
+}) {
+  if (!playbook.actions.length || job.status === "completed" || job.status === "lost") {
+    return null;
+  }
+
+  return (
+    <section className="data-panel recommended-actions-panel">
+      <div className="panel-heading compact">
+        <div>
+          <h2>Recommended Actions</h2>
+          <p className="muted">
+            {playbook.mode === "service" && playbook.service
+              ? `${playbook.service.label} playbook for this stage.`
+              : playbook.service
+                ? `Using the workspace default because ${playbook.service.label} has no override.`
+                : "Workspace default playbook for this stage."}
+          </p>
+        </div>
+        <span className="panel-count">{playbook.actions.length === 1 ? "1 action" : `${playbook.actions.length} actions`}</span>
+      </div>
+      <div className="recommended-actions-list">
+        {playbook.actions.map((action) => (
+          <article className="recommended-action-item" key={action.id}>
+            <div>
+              <strong>{action.action_label}</strong>
+              <span>{actionTypeLabels[action.action_type]}</span>
+            </div>
+            <RecommendedActionControl action={action} job={job} quote={quote} supportMode={supportMode} terminology={terminology} />
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function RecommendedActionControl({
+  action,
+  job,
+  quote,
+  supportMode,
+  terminology,
+}: {
+  action: BusinessActionPlaybook;
+  job: Job;
+  quote: Quote | null;
+  supportMode: SupportMode;
+  terminology: Terminology;
+}) {
+  if (action.action_type === "call") {
+    return job.customer?.phone ? <a className="button button-secondary" href={`tel:${job.customer.phone}`}>{action.action_label}</a> : <Link className="button button-secondary" href={scopedHref(`/jobs/${job.id}?edit=1#edit-job`, supportMode)}>Add phone</Link>;
+  }
+
+  if (action.action_type === "email") {
+    return job.customer?.email ? <a className="button button-secondary" href={`mailto:${job.customer.email}`}>{action.action_label}</a> : <Link className="button button-secondary" href={scopedHref(`/jobs/${job.id}?edit=1#edit-job`, supportMode)}>Add email</Link>;
+  }
+
+  if (action.action_type === "mark_contacted") {
+    return (
+      <form action={markJobContacted}>
+        <input type="hidden" name="jobId" value={job.id} />
+        <input type="hidden" name="returnTo" value={scopedHref(`/jobs/${job.id}`, supportMode)} />
+        <SupportModeInput supportMode={supportMode} />
+        <button className="button button-secondary" type="submit">{action.action_label}</button>
+      </form>
+    );
+  }
+
+  if (action.action_type === "set_follow_up") {
+    return <a className="button button-secondary" href="#quick-actions">{action.action_label}</a>;
+  }
+
+  if (action.action_type === "schedule") {
+    return <Link className="button button-secondary" href={scopedHref(`/jobs/${job.id}?edit=1#edit-job`, supportMode)}>{action.action_label}</Link>;
+  }
+
+  if (action.action_type === "review_proposal") {
+    return quote ? <a className="button button-secondary" href="#quote">{action.action_label}</a> : <Link className="button button-secondary" href={scopedHref(`/jobs/${job.id}#quote`, supportMode)}>Create {terminology.quote_singular}</Link>;
+  }
+
+  if (action.action_type === "mark_lost") {
+    return <a className="button button-secondary" href="#quick-actions">{action.action_label}</a>;
+  }
+
+  if (action.action_type === "custom_instruction") {
+    return <span className="playbook-instruction">{action.action_label}</span>;
+  }
+
+  return <Link className="button button-secondary" href={scopedHref(`/jobs/${job.id}`, supportMode)}>{action.action_label || `Open ${terminology.job_singular}`}</Link>;
+}
+
 function IntakeResponsesPanel({ intakeData }: { intakeData: Record<string, IntakeResponse> | null }) {
   const responses = Object.entries(intakeData ?? {})
     .map(([key, response]) => ({ key, response }))
@@ -825,7 +945,7 @@ function QuotePanel({ job, quote, quoteMessages, supportMode, terminology }: { j
           <Info label={`${terminology.quote_singular} amount`} value={money(quote.amount_cents)} />
           <Info label="Valid until" value={quote.valid_until ? dateLabel(quote.valid_until) : "Not set"} />
           <Info label="Sent" value={quote.sent_at ? dateLabel(quote.sent_at) : "Not sent"} />
-          <Info label={`Current ${lowerTerm(terminology.job_singular)} value`} value={money(job.price_cents)} />
+          <Info label="Current opportunity value" value={money(opportunityValueCents(job))} />
           <Info label={`${terminology.customer_singular} response`} value={quote.accepted_at ? `Accepted ${dateLabel(quote.accepted_at)}` : quote.declined_at ? `Declined ${dateLabel(quote.declined_at)}` : "Awaiting response"} />
         </div>
       ) : (
@@ -969,7 +1089,7 @@ function JobQuickActions({ job, supportMode, terminology }: { job: Job; supportM
   }
 
   return (
-    <section className="data-panel quick-actions-panel">
+    <section className="data-panel quick-actions-panel" id="quick-actions">
       <div className="panel-heading compact">
         <h2>Quick actions</h2>
         <p className="muted">Move this {lowerTerm(terminology.job_singular)} forward and keep the activity timeline accurate.</p>

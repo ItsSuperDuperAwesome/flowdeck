@@ -1,5 +1,7 @@
 import { createClient } from "@supabase/supabase-js";
+import { ToastMessage } from "@/app/toast-message";
 import { lowerTerm, normalizeTerminology } from "@/lib/job-tracker/config";
+import { successFeedbackMessage } from "@/lib/job-tracker/feedback";
 import { acceptPublicQuote, declinePublicQuote, sendPublicQuoteMessage } from "./actions";
 import { getSupabaseConfig } from "@/lib/supabase/env";
 import Link from "next/link";
@@ -73,6 +75,7 @@ export default async function PublicQuotePage({
 }) {
   const { token } = await params;
   const query = await searchParams;
+  const toastMessage = successFeedbackMessage(query.message);
   const { data, error } = await supabase().rpc("get_public_quote", {
     quote_token: token,
   });
@@ -99,7 +102,8 @@ export default async function PublicQuotePage({
             <p>Review the {lowerTerm(terminology.quote_singular)} below. You can accept it, decline it, or send a question back to the business.</p>
           </div>
 
-          {query.message ? <p className="form-message">{query.message}</p> : null}
+          {toastMessage ? <ToastMessage message={toastMessage} /> : null}
+          {query.message && !toastMessage ? <p className="form-message">{query.message}</p> : null}
 
           <div className="public-quote-summary">
             <div>

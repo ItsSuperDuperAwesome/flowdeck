@@ -24,7 +24,7 @@ export default async function Home({
   return (
     <main className="auth-page">
       <section className="auth-intro" aria-label="Product overview">
-        <div className="brand-mark">JT</div>
+        <div className="brand-mark">FD</div>
         <p className="eyebrow">FlowDeck</p>
         <h1>Run service jobs from quote to completion.</h1>
         <p>
@@ -47,7 +47,7 @@ export default async function Home({
         <div className="auth-panel-header">
           <p className="eyebrow">Welcome back</p>
           <h2>Sign in</h2>
-          <p className="muted">Use your confirmed Supabase account to open the dashboard.</p>
+          <p className="muted">Open your workspace and get back to the day’s work.</p>
         </div>
 
         <form className="form" action={login}>

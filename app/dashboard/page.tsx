@@ -1,10 +1,13 @@
 import { logout } from "@/app/auth/actions";
 import { createBusiness } from "@/app/dashboard/actions";
 import { DashboardClient } from "@/app/dashboard/dashboard-client";
+import { relevantSalesActivityTypes } from "@/lib/job-tracker/attention";
 import type {
   Business,
+  BusinessActionPlaybook,
   BusinessDashboardWidget,
   BusinessFollowupSettings,
+  BusinessOnboardingState,
   BusinessPipelineStatus,
   BusinessServiceType,
   BusinessTerminology,
@@ -16,11 +19,15 @@ import type {
   Quote,
   QuoteMessage,
 } from "@/lib/job-tracker/types";
+import { completedRevenueCents } from "@/lib/job-tracker/money";
 import { createClient } from "@/lib/supabase/server";
 import { hasSupabaseConfig } from "@/lib/supabase/env";
 import { redirect } from "next/navigation";
 
 export const dynamic = "force-dynamic";
+
+const validStatusFilters = ["lead", "contacted", "quoted", "scheduled", "in_progress", "completed", "lost"] as const;
+const validJobFilters = ["needs-attention", "open-pipeline"] as const;
 
 type JobRow = Omit<Job, "customer"> & {
   customers: Customer | Customer[] | null;
@@ -37,11 +44,17 @@ type QuoteMessageRow = QuoteMessage & {
 export default async function Dashboard({
   searchParams,
 }: {
-  searchParams: Promise<{ adminBusinessId?: string; filter?: string; message?: string; view?: string }>;
+  searchParams: Promise<{ adminBusinessId?: string; filter?: string; message?: string; settings?: string; view?: string }>;
 }) {
   const params = await searchParams;
-  const initialJobFilter = params.filter === "needs-attention" ? "needs-attention" : "all";
-  const initialView = dashboardViewFromParam(params.view) ?? (initialJobFilter === "needs-attention" ? "Jobs" : undefined);
+  const initialJobFilter = validJobFilters.includes(params.filter as (typeof validJobFilters)[number])
+    ? (params.filter as "needs-attention" | "open-pipeline")
+    : "all";
+  const initialStatusFilter = validStatusFilters.includes(params.filter as (typeof validStatusFilters)[number])
+    ? (params.filter as Job["status"])
+    : "all";
+  const initialView = dashboardViewFromParam(params.view) ?? (params.filter ? "Jobs" : undefined);
+  const initialSettingsTab = settingsTabFromParam(params.settings);
   const adminBusinessId = params.adminBusinessId;
 
   if (!hasSupabaseConfig()) {
@@ -77,7 +90,7 @@ export default async function Dashboard({
         .select("id, name, slug, workspace_status, intake_form_enabled, intake_form_title, intake_form_description")
         .eq("id", adminBusinessId)
         .single()
-    : { data: null, error: null };
+    : { data: null };
 
   const business = isAdminMode ? (adminBusiness as Business | null | undefined) : (memberships?.[0]?.businesses as Business | null | undefined);
 
@@ -147,6 +160,17 @@ export default async function Dashboard({
         .order("created_at", { ascending: true })
     : { data: [], error: null };
 
+  const { data: actionPlaybookRows, error: actionPlaybooksError } = business
+    ? await supabase
+        .from("business_action_playbooks")
+        .select("id, business_id, service_type_id, pipeline_status_id, pipeline_key, action_key, action_label, action_type, is_enabled, sort_order, created_at, updated_at")
+        .eq("business_id", business.id)
+        .order("pipeline_key", { ascending: true })
+        .order("service_type_id", { ascending: true })
+        .order("sort_order", { ascending: true })
+        .order("created_at", { ascending: true })
+    : { data: [], error: null };
+
   const { data: terminologyRow, error: terminologyError } = business
     ? await supabase
         .from("business_terminology")
@@ -162,6 +186,15 @@ export default async function Dashboard({
         .eq("business_id", business.id)
         .maybeSingle()
     : { data: null, error: null };
+
+  const { data: onboardingStateRow } = business && !isAdminMode
+    ? await supabase
+        .from("business_onboarding_states")
+        .select("business_id, user_id, source, started_at, completed_at, skipped_at, updated_at")
+        .eq("business_id", business.id)
+        .eq("user_id", data.claims.sub)
+        .maybeSingle()
+    : { data: null };
 
   const { data: quoteRows, error: quotesError } = business
     ? await supabase
@@ -181,8 +214,20 @@ export default async function Dashboard({
         .eq("source", "customer")
         .is("resolved_at", null)
         .order("created_at", { ascending: false })
-        .limit(8)
     : { data: [], error: null };
+
+  const attentionJobIds = ((jobRows ?? []) as unknown as JobRow[]).map((job) => job.id);
+  const { data: attentionActivityRows, error: attentionActivityError } =
+    business && attentionJobIds.length
+      ? await supabase
+          .from("job_activity")
+          .select("id, business_id, job_id, user_id, event_type, message, metadata, created_at, jobs(id, title, status)")
+          .eq("business_id", business.id)
+          .in("job_id", attentionJobIds)
+          .in("event_type", relevantSalesActivityTypes)
+          .order("created_at", { ascending: false })
+          .limit(Math.max(100, attentionJobIds.length * 8))
+      : { data: [], error: null };
 
   const schemaNeedsSetup =
     Boolean(
@@ -194,9 +239,11 @@ export default async function Dashboard({
         serviceTypesError ||
         pipelineStatusesError ||
         dashboardWidgetsError ||
+        actionPlaybooksError ||
         adminBusinessError ||
         terminologyError ||
         followupSettingsError ||
+        attentionActivityError ||
         quoteMessagesError ||
         quotesError,
     );
@@ -208,6 +255,10 @@ export default async function Dashboard({
 
   const customers = buildCustomerSummaries((customerRows ?? []) as Customer[], jobs);
   const activities: JobActivity[] = ((activityRows ?? []) as unknown as ActivityRow[]).map((activity) => ({
+    ...activity,
+    job: Array.isArray(activity.jobs) ? activity.jobs[0] ?? null : activity.jobs,
+  }));
+  const attentionActivities: JobActivity[] = ((attentionActivityRows ?? []) as unknown as ActivityRow[]).map((activity) => ({
     ...activity,
     job: Array.isArray(activity.jobs) ? activity.jobs[0] ?? null : activity.jobs,
   }));
@@ -250,6 +301,7 @@ export default async function Dashboard({
       ) : business ? (
         <DashboardClient
           activities={activities}
+          attentionActivities={attentionActivities}
           adminMode={isAdminMode && business ? { businessId: business.id, businessName: business.name } : null}
           business={business}
           customers={customers}
@@ -257,11 +309,16 @@ export default async function Dashboard({
           serviceTypes={(serviceTypeRows ?? []) as BusinessServiceType[]}
           pipelineStatuses={(pipelineStatusRows ?? []) as BusinessPipelineStatus[]}
           dashboardWidgets={(dashboardWidgetRows ?? []) as BusinessDashboardWidget[]}
+          actionPlaybooks={(actionPlaybookRows ?? []) as BusinessActionPlaybook[]}
           followupSettings={(followupSettingsRow ?? null) as BusinessFollowupSettings | null}
+          onboardingState={(onboardingStateRow ?? null) as BusinessOnboardingState | null}
           terminology={(terminologyRow ?? null) as BusinessTerminology | null}
           jobs={jobs}
           initialJobFilter={initialJobFilter}
+          initialSettingsTab={initialSettingsTab}
+          initialStatusFilter={initialStatusFilter}
           initialView={initialView}
+          key={`${business.id}:${initialView ?? "Overview"}:${initialJobFilter}:${initialStatusFilter}:${initialSettingsTab ?? ""}:${adminBusinessId ?? ""}`}
           message={params.message}
           quoteMessages={quoteMessages}
           quotes={(quoteRows ?? []) as Quote[]}
@@ -307,7 +364,7 @@ function buildCustomerSummaries(customers: Customer[], jobs: Job[]): CustomerSum
       completed_jobs: customerJobs.filter((job) => job.status === "completed").length,
       job_count: customerJobs.length,
       last_job_date: sortedJobs[0]?.scheduled_start ?? sortedJobs[0]?.created_at ?? null,
-      lifetime_value_cents: customerJobs.reduce((sum, job) => sum + job.revenue_cents, 0),
+      lifetime_value_cents: customerJobs.reduce((sum, job) => sum + completedRevenueCents(job), 0),
     };
   });
 }
@@ -330,4 +387,24 @@ function dashboardViewFromParam(value: string | undefined): "Overview" | "Pipeli
   };
 
   return viewMap[normalized];
+}
+
+function settingsTabFromParam(value: string | undefined): "Workspace" | "Terminology" | "Services" | "Pipeline" | "Dashboard" | "Public intake" | "Team Steps" | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  const tabMap: Record<string, "Workspace" | "Terminology" | "Services" | "Pipeline" | "Dashboard" | "Public intake" | "Team Steps"> = {
+    dashboard: "Dashboard",
+    intake: "Public intake",
+    pipeline: "Pipeline",
+    "public-intake": "Public intake",
+    services: "Services",
+    "team-steps": "Team Steps",
+    terminology: "Terminology",
+    workspace: "Workspace",
+  };
+
+  return tabMap[normalized];
 }

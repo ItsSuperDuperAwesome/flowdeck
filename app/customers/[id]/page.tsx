@@ -1,6 +1,9 @@
 import { createJob, updateCustomerByIdWithContactFallback } from "@/app/dashboard/actions";
 import { JobFields } from "@/app/dashboard/dashboard-client";
+import { ToastMessage } from "@/app/toast-message";
 import { displayWorkspaceName, normalizeTerminology, pipelineLabelMap, lowerTerm } from "@/lib/job-tracker/config";
+import { successFeedbackMessage } from "@/lib/job-tracker/feedback";
+import { completedRevenueCents, opportunityValueCents } from "@/lib/job-tracker/money";
 import type { BusinessPipelineStatus, BusinessTerminology, Customer, CustomerSummary, Job, JobStatus } from "@/lib/job-tracker/types";
 import { createClient } from "@/lib/supabase/server";
 import Link from "next/link";
@@ -112,6 +115,7 @@ export default async function CustomerDetail({
 }) {
   const { id } = await params;
   const query = await searchParams;
+  const toastMessage = successFeedbackMessage(query.message);
   const supabase = await createClient();
   const { data: auth, error: authError } = await supabase.auth.getClaims();
 
@@ -188,7 +192,7 @@ export default async function CustomerDetail({
     active: activeJobs.length,
     completed: jobs.filter((job) => job.status === "completed").length,
     total: jobs.length,
-    value: jobs.reduce((sum, job) => sum + job.revenue_cents, 0),
+    value: jobs.reduce((sum, job) => sum + completedRevenueCents(job), 0),
   };
   const lastJob = jobs[0]?.scheduled_start ?? jobs[0]?.created_at ?? null;
   const customers = ((customerRows ?? []) as Customer[]).map((row) => ({
@@ -242,7 +246,8 @@ export default async function CustomerDetail({
         </div>
       </div>
 
-      {query.message ? <p className="success-message">{query.message}</p> : null}
+      {toastMessage ? <ToastMessage message={toastMessage} /> : null}
+      {query.message && !toastMessage ? <p className="success-message">{query.message}</p> : null}
 
       <section className="detail-main">
         <section className="kpi-grid detail-kpis">
@@ -309,7 +314,7 @@ export default async function CustomerDetail({
                         <span className={`status-pill status-${job.status}`}>{configuredStatusLabels[job.status]}</span>
                       </td>
                       <td>{job.scheduled_start ? dateTimeLabel(job.scheduled_start) : "Unscheduled"}</td>
-                      <td>{money(job.price_cents)}</td>
+                      <td>{money(opportunityValueCents(job))}</td>
                       <td>
                         <Link className="link-button" href={scopedHref(`/jobs/${job.id}`, supportMode)}>
                           Open

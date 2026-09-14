@@ -24,6 +24,16 @@ export type JobSource =
   | "other";
 
 export type QuoteStatus = "draft" | "sent" | "accepted" | "declined";
+export type ActionPlaybookType =
+  | "call"
+  | "email"
+  | "set_follow_up"
+  | "schedule"
+  | "review_proposal"
+  | "mark_contacted"
+  | "mark_lost"
+  | "custom_instruction"
+  | "open_opportunity";
 
 export type IntakeFieldType = "short_text" | "long_text" | "number" | "select" | "checkbox" | "date";
 export type JobFileCategory = "intake" | "before" | "damage" | "prep" | "progress" | "completed" | "other";
@@ -133,6 +143,21 @@ export type BusinessDashboardWidget = {
   updated_at: string;
 };
 
+export type BusinessActionPlaybook = {
+  id: string;
+  business_id: string;
+  service_type_id: string | null;
+  pipeline_status_id: string | null;
+  pipeline_key: JobStatus;
+  action_key: string;
+  action_label: string;
+  action_type: ActionPlaybookType;
+  is_enabled: boolean;
+  sort_order: number;
+  created_at: string;
+  updated_at: string;
+};
+
 export type BusinessFollowupSettings = {
   business_id: string;
   new_lead_followup_hours: number;
@@ -141,6 +166,16 @@ export type BusinessFollowupSettings = {
   stale_opportunity_days: number;
   reminders_enabled: boolean;
   created_at: string;
+  updated_at: string;
+};
+
+export type BusinessOnboardingState = {
+  business_id: string;
+  user_id: string;
+  source: "owner_invite" | "manual_restart";
+  started_at: string;
+  completed_at: string | null;
+  skipped_at: string | null;
   updated_at: string;
 };
 

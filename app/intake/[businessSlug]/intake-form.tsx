@@ -2,7 +2,7 @@
 
 import { lowerTerm, normalizeTerminology, type Terminology } from "@/lib/job-tracker/config";
 import type { IntakeField } from "@/lib/job-tracker/types";
-import { useMemo, useState } from "react";
+import { useState } from "react";
 
 type IntakeFormProps = {
   businessName: string;
@@ -24,15 +24,20 @@ export function IntakeForm({ businessName, businessSlug, customFields, descripti
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [success, setSuccess] = useState("");
   const [photoNames, setPhotoNames] = useState<string[]>([]);
-  const dedupeKey = useMemo(() => crypto.randomUUID(), []);
 
   async function submit(formData: FormData) {
     setError("");
     setSuccess("");
     setIsSubmitting(true);
-    formData.set("dedupeKey", dedupeKey);
+    formData.set("intakeStartedAt", String(Math.round(Date.now() - performance.now())));
 
     try {
+      const formError = validateRequiredFields(formData, customFields, terminology);
+      if (formError) {
+        setError(formError);
+        return;
+      }
+
       const photos = formData.getAll("photos").filter((value): value is File => value instanceof File && value.size > 0);
       const photoError = validatePhotos(photos);
 
@@ -81,7 +86,7 @@ export function IntakeForm({ businessName, businessSlug, customFields, descripti
         <p>{description}</p>
       </div>
 
-      <form action={submit} className="public-intake-form">
+      <form action={submit} className="public-intake-form" noValidate>
         <input aria-hidden="true" autoComplete="off" className="honeypot" name="companyWebsite" tabIndex={-1} />
         <div className="field">
           <label htmlFor="fullName">Full name</label>
@@ -189,6 +194,37 @@ export function IntakeForm({ businessName, businessSlug, customFields, descripti
       </form>
     </section>
   );
+}
+
+function validateRequiredFields(formData: FormData, customFields: IntakeField[], terminology: Terminology) {
+  if (!String(formData.get("fullName") ?? "").trim()) {
+    return "Enter your full name.";
+  }
+
+  if (!String(formData.get("serviceType") ?? "").trim()) {
+    return `Choose a ${lowerTerm(terminology.job_singular)} type.`;
+  }
+
+  if (!String(formData.get("projectDescription") ?? "").trim()) {
+    return `Tell us about the ${lowerTerm(terminology.job_singular)}.`;
+  }
+
+  for (const field of customFields) {
+    if (!field.required) {
+      continue;
+    }
+
+    const value = formData.get(`custom_${field.field_key}`);
+    if (field.field_type === "checkbox") {
+      if (value !== "true") {
+        return `Complete "${field.label}" before sending.`;
+      }
+    } else if (!String(value ?? "").trim()) {
+      return `Complete "${field.label}" before sending.`;
+    }
+  }
+
+  return null;
 }
 
 function validatePhotos(files: File[]) {

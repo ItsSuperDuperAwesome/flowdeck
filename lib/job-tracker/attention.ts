@@ -29,9 +29,57 @@ export type AttentionIssue = {
   why: string;
 };
 
+export const relevantSalesActivityTypes = [
+  "contacted",
+  "follow_up_set",
+  "quote_created",
+  "quote_updated",
+  "quote_sent",
+  "quote_accepted",
+  "quote_declined",
+  "quote_message_received",
+  "quote_message_replied",
+  "quote_message_resolved",
+  "quoted",
+  "scheduled",
+  "status_changed",
+] as const;
+
+const salesActivityTypes = new Set<string>(relevantSalesActivityTypes);
+
+function startOfLocalDay(value: Date) {
+  return new Date(value.getFullYear(), value.getMonth(), value.getDate()).getTime();
+}
+
+function localDayDiff(from: string, to = new Date()) {
+  const fromDate = new Date(from);
+
+  if (Number.isNaN(fromDate.getTime())) {
+    return 0;
+  }
+
+  return Math.floor((startOfLocalDay(to) - startOfLocalDay(fromDate)) / 86_400_000);
+}
+
+function newestTimestamp(...values: Array<string | null | undefined>) {
+  return values.reduce<string | null>((latest, value) => {
+    if (!value) {
+      return latest;
+    }
+
+    const time = new Date(value).getTime();
+    const latestTime = latest ? new Date(latest).getTime() : Number.NEGATIVE_INFINITY;
+
+    if (Number.isNaN(time)) {
+      return latest;
+    }
+
+    return time > latestTime ? value : latest;
+  }, null);
+}
+
 export function ageLabel(value: string) {
-  const ageMs = Date.now() - new Date(value).getTime();
-  const days = Math.max(0, Math.floor(ageMs / 86_400_000));
+  const days = Math.max(0, localDayDiff(value));
 
   if (days === 0) {
     return "New today";
@@ -45,26 +93,47 @@ export function ageLabel(value: string) {
 }
 
 export function dueLabel(value: string) {
-  const diffMs = new Date(value).getTime() - Date.now();
-  const absDays = Math.max(0, Math.ceil(Math.abs(diffMs) / 86_400_000));
+  const dueAt = new Date(value);
 
-  if (diffMs < 0) {
-    if (absDays <= 1) {
-      return "Due today";
-    }
-
-    return `${absDays} days overdue`;
+  if (Number.isNaN(dueAt.getTime())) {
+    return "Date needed";
   }
 
-  if (absDays <= 1) {
+  const days = localDayDiff(value);
+
+  if (days > 0) {
+    return days === 1 ? "1 day overdue" : `${days} days overdue`;
+  }
+
+  if (days === 0) {
+    return "Due today";
+  }
+
+  const daysUntil = Math.abs(days);
+
+  if (daysUntil <= 1) {
     return "Due soon";
   }
 
-  return `Due in ${absDays} days`;
+  return `Due in ${daysUntil} days`;
 }
 
 export function daysSince(value: string) {
-  return Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 86_400_000));
+  return Math.max(0, localDayDiff(value));
+}
+
+function waitingLabel(value: string) {
+  const days = daysSince(value);
+
+  if (days === 0) {
+    return "Waiting today";
+  }
+
+  if (days === 1) {
+    return "1 day waiting";
+  }
+
+  return `${days} days waiting`;
 }
 
 export function attentionSeverity(priority: number): AttentionSeverity {
@@ -125,6 +194,10 @@ export function buildAttentionIssues(input: {
   });
 
   activities.forEach((activity) => {
+    if (!salesActivityTypes.has(activity.event_type)) {
+      return;
+    }
+
     const current = latestActivityByJob.get(activity.job_id);
     if (!current || activity.created_at > current.created_at) {
       latestActivityByJob.set(activity.job_id, activity);
@@ -169,14 +242,31 @@ export function buildAttentionIssues(input: {
     const hasFutureFollowUp = Boolean(followUpAt && followUpAt > now);
     const latestQuote = latestQuoteByJob.get(job.id);
     const quoteIsClosed = latestQuote?.status === "accepted" || latestQuote?.status === "declined";
-    const lastSalesActivityAt = latestActivityByJob.get(job.id)?.created_at ?? job.updated_at;
+    const latestQuoteActivityAt = newestTimestamp(latestQuote?.accepted_at, latestQuote?.declined_at, latestQuote?.sent_at, latestQuote?.updated_at, latestQuote?.created_at);
+    const latestMessageActivityAt = newestTimestamp(
+      ...quoteMessages
+        .filter((message) => message.job_id === job.id && ["business", "customer"].includes(message.source))
+        .map((message) => message.resolved_at ?? message.created_at),
+    );
+    const fallbackStageActivityAt =
+      job.status === "quoted"
+        ? newestTimestamp(job.quote_sent_at, job.first_contact_at, job.created_at)
+        : job.status === "contacted"
+          ? newestTimestamp(job.first_contact_at, job.created_at)
+          : job.created_at;
+    const lastSalesActivityAt = newestTimestamp(
+      latestActivityByJob.get(job.id)?.created_at,
+      latestMessageActivityAt,
+      latestQuoteActivityAt,
+      fallbackStageActivityAt,
+    ) ?? job.created_at;
     let hasPrimaryReminder = false;
 
     if (followupSettings.reminders_enabled && job.next_follow_up_at) {
       const todayEnd = new Date();
       todayEnd.setHours(23, 59, 59, 999);
 
-      if (followUpAt && followUpAt <= now) {
+      if (followUpAt && followUpAt <= now && localDayDiff(job.next_follow_up_at) > 0) {
         hasPrimaryReminder = true;
         items.push(issue({
           action: "Follow up, then set the next follow-up date.",
@@ -292,12 +382,12 @@ export function buildAttentionIssues(input: {
     if ((job.status === "contacted" || job.status === "quoted") && !job.scheduled_start && !quoteIsClosed) {
       items.push(issue({
         action: `Schedule the ${jobTerm} or mark it lost.`,
-        age: ageLabel(job.created_at),
+        age: waitingLabel(job.quote_sent_at ?? job.first_contact_at ?? job.created_at),
         id: `${job.id}-unscheduled`,
         job,
         priority: 6,
         problem: "Opportunity is not scheduled",
-        sortAt: job.updated_at,
+        sortAt: job.quote_sent_at ?? job.first_contact_at ?? job.created_at,
         type: "unscheduled",
         why: "Active opportunities without a confirmed schedule can fall between sales and operations.",
       }));
@@ -311,7 +401,7 @@ export function buildAttentionIssues(input: {
         job,
         priority: 0,
         problem: `Scheduled ${jobTerm} has no start date`,
-        sortAt: job.updated_at,
+        sortAt: job.created_at,
         type: "scheduled_no_date",
         why: "Scheduled work needs a confirmed date before it can reliably appear on the calendar.",
       }));

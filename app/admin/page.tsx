@@ -1,6 +1,9 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
+import { createAdminWorkspace } from "@/app/admin/actions";
+import { ToastMessage } from "@/app/toast-message";
 import { displayWorkspaceName } from "@/lib/job-tracker/config";
+import { successFeedbackMessage } from "@/lib/job-tracker/feedback";
 import { createClient } from "@/lib/supabase/server";
 
 export const dynamic = "force-dynamic";
@@ -26,9 +29,10 @@ type AdminWorkspace = {
 export default async function AdminHome({
   searchParams,
 }: {
-  searchParams: Promise<{ q?: string }>;
+  searchParams: Promise<{ message?: string; q?: string }>;
 }) {
   const params = await searchParams;
+  const toastMessage = successFeedbackMessage(params.message);
   const query = (params.q ?? "").trim().toLowerCase();
   const supabase = await createClient();
   const { data: auth } = await supabase.auth.getClaims();
@@ -75,11 +79,17 @@ export default async function AdminHome({
             <h1>Client workspaces</h1>
             <p className="muted">Operate FlowDeck customer accounts without becoming a workspace member.</p>
           </div>
-          <form className="admin-search">
-            <input name="q" placeholder="Search name, slug, or owner" defaultValue={params.q ?? ""} />
-            <button className="button button-secondary" type="submit">Search</button>
-          </form>
+          <div className="header-actions">
+            <a className="button" href="#new-workspace">New Workspace</a>
+            <form className="admin-search">
+              <input name="q" placeholder="Search name, slug, or owner" defaultValue={params.q ?? ""} />
+              <button className="button button-secondary" type="submit">Search</button>
+            </form>
+          </div>
         </header>
+
+        {toastMessage ? <ToastMessage message={toastMessage} /> : null}
+        {params.message && !toastMessage ? <p className="success-message">{params.message}</p> : null}
 
         <section className="kpi-grid kpi-grid-primary">
           <Metric label="Total workspaces" value={allWorkspaces.length} />
@@ -130,6 +140,45 @@ export default async function AdminHome({
               </tbody>
             </table>
           </div>
+        </section>
+
+        <section className="data-panel full-width" id="new-workspace">
+          <div className="panel-heading">
+            <div>
+              <h2>New Workspace</h2>
+              <p className="muted">Create a client tenant with default services, pipeline, dashboard, intake, and follow-up settings.</p>
+            </div>
+          </div>
+          <form className="settings-form admin-create-workspace-form" action={createAdminWorkspace}>
+            <div className="split-fields">
+              <div className="field">
+                <label htmlFor="workspace-name">Business/workspace name</label>
+                <input id="workspace-name" name="name" placeholder="North Texas Roofing" required />
+              </div>
+              <div className="field">
+                <label htmlFor="workspace-slug">Workspace slug</label>
+                <input id="workspace-slug" name="slug" placeholder="north-texas-roofing" pattern="[a-z0-9][a-z0-9-]{1,62}[a-z0-9]" required />
+              </div>
+            </div>
+            <div className="split-fields">
+              <div className="field">
+                <label htmlFor="owner-email">Primary owner email</label>
+                <input id="owner-email" name="ownerEmail" type="email" placeholder="owner@example.com" />
+              </div>
+              <div className="field">
+                <label htmlFor="new-workspace-status">Status</label>
+                <select id="new-workspace-status" name="workspaceStatus" defaultValue="trial">
+                  <option value="trial">Trial</option>
+                  <option value="active">Active</option>
+                  <option value="paused">Paused</option>
+                </select>
+              </div>
+            </div>
+            <p className="muted">
+              Owner email is stored for handoff/admin reference. It does not create an auth user or add the FlowDeck admin as a workspace member.
+            </p>
+            <button className="button" type="submit">Create Workspace</button>
+          </form>
         </section>
       </section>
     </main>

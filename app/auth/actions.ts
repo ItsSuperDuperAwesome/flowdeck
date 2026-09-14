@@ -10,6 +10,15 @@ function encodedMessage(message: string) {
   return encodeURIComponent(message);
 }
 
+function safeNext(value: FormDataEntryValue | null) {
+  const next = String(value ?? "").trim();
+  if (!next || !next.startsWith("/") || next.startsWith("//") || next.includes("://")) {
+    return "/dashboard";
+  }
+
+  return next;
+}
+
 function authMessage(error: { code?: string; message: string }) {
   if (error.code === "over_email_send_rate_limit") {
     return "Supabase hit its built-in email limit. Wait for the cooldown, add custom SMTP, or create a confirmed test user in Supabase Auth.";
@@ -29,6 +38,7 @@ export async function login(formData: FormData) {
 
   const email = String(formData.get("email") ?? "");
   const password = String(formData.get("password") ?? "");
+  const next = safeNext(formData.get("next"));
   const supabase = await createClient();
 
   const { error } = await supabase.auth.signInWithPassword({
@@ -41,7 +51,7 @@ export async function login(formData: FormData) {
   }
 
   revalidatePath("/", "layout");
-  redirect("/dashboard");
+  redirect(next);
 }
 
 export async function signUp(formData: FormData) {
@@ -51,6 +61,7 @@ export async function signUp(formData: FormData) {
 
   const email = String(formData.get("email") ?? "");
   const password = String(formData.get("password") ?? "");
+  const next = safeNext(formData.get("next"));
   const headersList = await headers();
   const host = headersList.get("x-forwarded-host") ?? headersList.get("host");
   const protocol = headersList.get("x-forwarded-proto") ?? "http";
@@ -61,7 +72,7 @@ export async function signUp(formData: FormData) {
     email,
     password,
     options: {
-      emailRedirectTo: `${origin}/auth/callback`,
+      emailRedirectTo: `${origin}/auth/callback?next=${encodeURIComponent(next)}`,
     },
   });
 
@@ -72,7 +83,7 @@ export async function signUp(formData: FormData) {
   revalidatePath("/", "layout");
 
   if (data.session) {
-    redirect("/dashboard");
+    redirect(next);
   }
 
   redirect(

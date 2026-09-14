@@ -2,14 +2,16 @@ import { createClient } from "@supabase/supabase-js";
 import { defaultServiceTypes } from "@/lib/job-tracker/config";
 import { getSupabaseConfig } from "@/lib/supabase/env";
 import type { IntakeField, IntakeResponse } from "@/lib/job-tracker/types";
+import { createHash } from "node:crypto";
 import { NextResponse } from "next/server";
 
 export const runtime = "nodejs";
 
 const MAX_IMAGES = 5;
 const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
+const MAX_UPLOADS_PER_INTAKE_TOKEN = 10;
+const MAX_BODY_SIZE = 58 * 1024 * 1024;
 const IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
-const rateLimit = new Map<string, { count: number; resetAt: number }>();
 
 type CustomFieldValidation = { customData: Record<string, IntakeResponse> } | { error: string };
 
@@ -17,27 +19,62 @@ function text(value: FormDataEntryValue | null, maxLength: number) {
   return String(value ?? "").trim().slice(0, maxLength);
 }
 
+function isTooLong(value: FormDataEntryValue | null, maxLength: number) {
+  return typeof value === "string" && value.trim().length > maxLength;
+}
+
 function normalizePhone(value: string) {
-  return value.replace(/\D/g, "");
+  const digits = value.replace(/\D/g, "");
+  return digits.length === 11 && digits.startsWith("1") ? digits.slice(1) : digits;
 }
 
 function errorResponse(message: string, status = 400) {
   return NextResponse.json({ ok: false, message }, { status });
 }
 
-function isRateLimited(request: Request) {
+function sha256(value: string) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function requestFingerprint(request: Request) {
   const forwarded = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
-  const key = forwarded || request.headers.get("x-real-ip") || "local";
+  const ip = forwarded || request.headers.get("x-real-ip") || "local";
+  const userAgent = request.headers.get("user-agent") || "unknown";
+  const language = request.headers.get("accept-language") || "unknown";
+  return sha256([ip, userAgent, language].join("|"));
+}
+
+function stableDedupeKey(input: {
+  budgetRange: string;
+  businessSlug: string;
+  city: string;
+  contactEmail: string;
+  normalizedPhone: string;
+  postalCode: string;
+  preferredDate: string | null;
+  projectDescription: string;
+  serviceType: string;
+  squareFeet: number | null;
+  state: string;
+  streetAddress: string;
+  customData: Record<string, IntakeResponse>;
+}) {
   const now = Date.now();
-  const current = rateLimit.get(key);
-
-  if (!current || current.resetAt < now) {
-    rateLimit.set(key, { count: 1, resetAt: now + 60_000 });
-    return false;
-  }
-
-  current.count += 1;
-  return current.count > 8;
+  const windowMs = 30 * 60_000;
+  const windowBucket = Math.floor(now / windowMs);
+  return sha256(JSON.stringify({
+    ...input,
+    budgetRange: input.budgetRange.toLowerCase(),
+    businessSlug: input.businessSlug.trim().toLowerCase(),
+    city: input.city.toLowerCase(),
+    contactEmail: input.contactEmail.toLowerCase(),
+    postalCode: input.postalCode.toLowerCase(),
+    projectDescription: input.projectDescription.toLowerCase().replace(/\s+/g, " "),
+    serviceType: input.serviceType.toLowerCase(),
+    state: input.state.toLowerCase(),
+    streetAddress: input.streetAddress.toLowerCase().replace(/\s+/g, " "),
+    windowBucket,
+  }));
 }
 
 function extensionFor(type: string) {
@@ -200,9 +237,10 @@ function supabase() {
 
 export async function POST(request: Request, context: { params: Promise<{ businessSlug: string }> }) {
   const { businessSlug } = await context.params;
+  const contentLength = Number(request.headers.get("content-length") ?? 0);
 
-  if (isRateLimited(request)) {
-    return errorResponse("Too many submissions. Please wait a minute and try again.", 429);
+  if (contentLength > MAX_BODY_SIZE) {
+    return errorResponse("That submission is too large. Please reduce the photos or message length and try again.", 413);
   }
 
   let formData: FormData;
@@ -214,7 +252,28 @@ export async function POST(request: Request, context: { params: Promise<{ busine
   }
 
   if (text(formData.get("companyWebsite"), 200)) {
-    return errorResponse("We could not accept that submission.", 400);
+    return NextResponse.json({ ok: true, message: "Your request was received." });
+  }
+
+  const startedAt = Number(text(formData.get("intakeStartedAt"), 20));
+
+  if (Number.isFinite(startedAt) && startedAt > 0 && Date.now() - startedAt < 1_500) {
+    return errorResponse("We could not submit your request. Please review the form and try again.");
+  }
+
+  if (
+    isTooLong(formData.get("fullName"), 120) ||
+    isTooLong(formData.get("email"), 180) ||
+    isTooLong(formData.get("phone"), 40) ||
+    isTooLong(formData.get("serviceType"), 120) ||
+    isTooLong(formData.get("projectDescription"), 2000) ||
+    isTooLong(formData.get("streetAddress"), 180) ||
+    isTooLong(formData.get("city"), 80) ||
+    isTooLong(formData.get("state"), 40) ||
+    isTooLong(formData.get("postalCode"), 20) ||
+    isTooLong(formData.get("budgetRange"), 80)
+  ) {
+    return errorResponse("One of the form fields is too long. Please shorten it and try again.");
   }
 
   const fullName = text(formData.get("fullName"), 120);
@@ -231,7 +290,6 @@ export async function POST(request: Request, context: { params: Promise<{ busine
   const squareFeetRaw = text(formData.get("squareFeet"), 20);
   const squareFeet = squareFeetRaw ? Number(squareFeetRaw) : null;
   const budgetRange = text(formData.get("budgetRange"), 80);
-  const dedupeKey = text(formData.get("dedupeKey"), 120) || crypto.randomUUID();
   const intakeUploadToken = crypto.randomUUID();
 
   if (!fullName || !serviceType || !projectDescription) {
@@ -283,10 +341,45 @@ export async function POST(request: Request, context: { params: Promise<{ busine
     return errorResponse(customResult.error);
   }
 
+  const dedupeKey = stableDedupeKey({
+    budgetRange,
+    businessSlug,
+    city,
+    contactEmail,
+    customData: customResult.customData,
+    normalizedPhone,
+    postalCode,
+    preferredDate,
+    projectDescription,
+    serviceType: matchedService.key,
+    squareFeet,
+    state,
+    streetAddress,
+  });
+
+  const { data: throttle, error: throttleError } = await client.rpc("check_public_intake_throttle", {
+    business_slug: businessSlug,
+    dedupe_key_hash: dedupeKey,
+    request_fingerprint_hash: requestFingerprint(request),
+  });
+
+  if (throttleError || !throttle?.ok) {
+    return errorResponse(
+      throttle?.code === "rate_limited"
+        ? "Too many requests. Please wait a moment and try again."
+        : "We could not submit your request. Please try again.",
+      throttle?.code === "rate_limited" ? 429 : 400,
+    );
+  }
+
   const photos = formData.getAll("photos").filter((value): value is File => value instanceof File && value.size > 0);
 
   if (photos.length > MAX_IMAGES) {
     return errorResponse(`Please upload ${MAX_IMAGES} photos or fewer.`);
+  }
+
+  if (photos.length > MAX_UPLOADS_PER_INTAKE_TOKEN) {
+    return errorResponse("Please upload fewer photos with this request.");
   }
 
   for (const photo of photos) {

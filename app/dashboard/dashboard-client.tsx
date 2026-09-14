@@ -1,8 +1,10 @@
 "use client";
 
 import { logout } from "@/app/auth/actions";
+import { ToastMessage } from "@/app/toast-message";
 import {
   archiveIntakeField,
+  createActionPlaybook,
   createCustomer,
   createIntakeField,
   createJob,
@@ -11,7 +13,9 @@ import {
   moveConfigItem,
   moveIntakeField,
   resolveQuoteMessage,
+  updateActionPlaybook,
   updateBusiness,
+  updateOnboardingState,
   updateCustomer,
   updateDashboardWidgetConfig,
   updateFollowupSettings,
@@ -45,10 +49,15 @@ import {
   serviceKey,
   type Terminology,
 } from "@/lib/job-tracker/config";
+import { completedRevenueCents, isOpenPipelineStatus, openPipelineValueCents, opportunityValueCents, wonValueCents } from "@/lib/job-tracker/money";
+import { successFeedbackMessage } from "@/lib/job-tracker/feedback";
+import { actionTypeOrder, defaultActionLabel, resolvePlaybookForJob } from "@/lib/job-tracker/playbooks";
 import type {
+  BusinessActionPlaybook,
   Business,
   BusinessDashboardWidget,
   BusinessFollowupSettings,
+  BusinessOnboardingState,
   BusinessPipelineStatus,
   BusinessServiceType,
   BusinessTerminology,
@@ -61,32 +70,40 @@ import type {
   JobActivity,
   JobSource,
   JobStatus,
+  ActionPlaybookType,
   Quote,
   QuoteMessage,
 } from "@/lib/job-tracker/types";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import type { KeyboardEvent, MouseEvent } from "react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useFormStatus } from "react-dom";
 
 type View = "Overview" | "Pipeline" | "Jobs" | "Customers" | "Calendar" | "Analytics" | "Settings";
 type CalendarMode = "Week" | "Month" | "Agenda";
 type SupportMode = { businessId: string; businessName: string } | null;
-type JobFilterMode = "all" | "needs-attention";
+type JobFilterMode = "all" | "needs-attention" | "open-pipeline";
+type DashboardFilter = JobFilterMode | JobStatus;
+type SettingsTab = "Workspace" | "Terminology" | "Services" | "Pipeline" | "Dashboard" | "Public intake" | "Team Steps";
 
 type DashboardClientProps = {
   activities: JobActivity[];
+  attentionActivities: JobActivity[];
   adminMode?: SupportMode;
   business: Business;
   customers: CustomerSummary[];
+  actionPlaybooks: BusinessActionPlaybook[];
   dashboardWidgets: BusinessDashboardWidget[];
   followupSettings: BusinessFollowupSettings | null;
   intakeFields: IntakeField[];
   initialView?: View;
   initialJobFilter?: JobFilterMode;
+  initialSettingsTab?: SettingsTab;
+  initialStatusFilter?: "all" | JobStatus;
   jobs: Job[];
   message?: string;
+  onboardingState: BusinessOnboardingState | null;
   pipelineStatuses: BusinessPipelineStatus[];
   quoteMessages: (QuoteMessage & { job: Job | null })[];
   quotes: Quote[];
@@ -203,6 +220,16 @@ function pluralize(count: number, singular: string, plural = `${singular}s`) {
   return `${count} ${count === 1 ? singular : plural}`;
 }
 
+function indefiniteTerm(term: string) {
+  const normalized = lowerTerm(term).trim();
+  const article = /^[aeiou]/i.test(normalized) ? "an" : "a";
+  return `${article} ${normalized}`;
+}
+
+function isOpenPipelineJob(job: Job) {
+  return isOpenPipelineStatus(job.status);
+}
+
 function scopedHref(href: string, supportMode: SupportMode) {
   if (!supportMode || href.startsWith("#") || href.startsWith("tel:") || href.startsWith("mailto:") || href.startsWith("http")) {
     return href;
@@ -214,7 +241,7 @@ function scopedHref(href: string, supportMode: SupportMode) {
   return hash ? `${scoped}#${hash}` : scoped;
 }
 
-function dashboardHref(view: View, supportMode: SupportMode, filter?: JobFilterMode) {
+function dashboardHref(view: View, supportMode: SupportMode, filter?: DashboardFilter) {
   const params = new URLSearchParams();
 
   if (view !== "Overview") {
@@ -228,6 +255,14 @@ function dashboardHref(view: View, supportMode: SupportMode, filter?: JobFilterM
   const query = params.toString();
   const base = query ? `/dashboard?${query}` : "/dashboard";
   return scopedHref(base, supportMode);
+}
+
+function settingsHref(tab: SettingsTab, supportMode: SupportMode) {
+  return scopedHref(`/dashboard?view=Settings&settings=${settingsParam(tab)}`, supportMode);
+}
+
+function settingsParam(tab: SettingsTab) {
+  return tab.toLowerCase().replaceAll(" ", "-");
 }
 
 function address(customer: Customer | CustomerSummary | null) {
@@ -244,6 +279,10 @@ function startOfWeek(date: Date) {
   const copy = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
   copy.setUTCDate(copy.getUTCDate() - copy.getUTCDay());
   return copy;
+}
+
+function startOfDay(date: Date) {
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
 }
 
 function sameDate(a: Date, b: Date) {
@@ -318,16 +357,21 @@ function openCustomerRowFromKeyboard(event: KeyboardEvent<HTMLTableRowElement>, 
 
 export function DashboardClient({
   activities,
+  actionPlaybooks,
+  attentionActivities,
   adminMode,
   business,
   customers,
   dashboardWidgets,
   followupSettings,
   initialJobFilter = "all",
+  initialSettingsTab,
+  initialStatusFilter = "all",
   intakeFields,
   initialView,
   jobs,
   message,
+  onboardingState,
   pipelineStatuses,
   quoteMessages,
   quotes,
@@ -335,6 +379,7 @@ export function DashboardClient({
   terminology,
   userEmail,
 }: DashboardClientProps) {
+  const toastMessage = successFeedbackMessage(message);
   const router = useRouter();
   const supportMode = adminMode ?? null;
   const workspaceName = displayWorkspaceName(business.name);
@@ -344,10 +389,11 @@ export function DashboardClient({
   const [jobModal, setJobModal] = useState<{ job?: Job; scheduledStart?: Date } | null>(null);
   const [customerModal, setCustomerModal] = useState<CustomerSummary | null | "new">(null);
   const [query, setQuery] = useState("");
-  const [statusFilter, setStatusFilter] = useState<"all" | JobStatus>("all");
+  const [statusFilter, setStatusFilter] = useState<"all" | JobStatus>(initialStatusFilter);
   const [sort, setSort] = useState("scheduled");
   const [calendarMode, setCalendarMode] = useState<CalendarMode>("Week");
   const [calendarDate, setCalendarDate] = useState(new Date());
+  const showOnboarding = Boolean(onboardingState && !onboardingState.completed_at && !onboardingState.skipped_at && !supportMode);
 
   const counts = useMemo(
     () => ({
@@ -370,8 +416,8 @@ export function DashboardClient({
   const configuredFollowupSettings = useMemo(() => normalizeFollowupSettings(followupSettings), [followupSettings]);
   const terms = useMemo(() => normalizeTerminology(terminology), [terminology]);
   const needsAttention = useMemo(
-    () => buildAttentionIssues({ activities, followupSettings: configuredFollowupSettings, jobs, quoteMessages, quotes, terminology: terms }),
-    [activities, configuredFollowupSettings, jobs, quoteMessages, quotes, terms],
+    () => buildAttentionIssues({ activities: attentionActivities, followupSettings: configuredFollowupSettings, jobs, quoteMessages, quotes, terminology: terms }),
+    [attentionActivities, configuredFollowupSettings, jobs, quoteMessages, quotes, terms],
   );
   const attentionByJob = useMemo(() => issuesByJobId(needsAttention), [needsAttention]);
   const attentionJobIds = useMemo(() => new Set(attentionByJob.keys()), [attentionByJob]);
@@ -386,7 +432,9 @@ export function DashboardClient({
             .toLowerCase();
 
           return (
-            (jobFilterMode === "all" || activeView !== "Jobs" || attentionJobIds.has(job.id)) &&
+            ((activeView !== "Jobs" || jobFilterMode === "all") ||
+              (jobFilterMode === "needs-attention" && attentionJobIds.has(job.id)) ||
+              (jobFilterMode === "open-pipeline" && isOpenPipelineJob(job))) &&
             (statusFilter === "all" || job.status === statusFilter) &&
             (!normalizedQuery || searchable.includes(normalizedQuery))
           );
@@ -428,13 +476,12 @@ export function DashboardClient({
   );
 
   const totalPipeline = jobs
-    .filter((job) => job.status !== "completed" && job.status !== "lost")
-    .reduce((sum, job) => sum + job.price_cents, 0);
+    .filter(isOpenPipelineJob)
+    .reduce((sum, job) => sum + openPipelineValueCents(job), 0);
   const completedRevenue = jobs
-    .filter((job) => job.status === "completed")
-    .reduce((sum, job) => sum + job.revenue_cents, 0);
+    .reduce((sum, job) => sum + completedRevenueCents(job), 0);
   const averageJobValue = jobs.length
-    ? Math.round(jobs.reduce((sum, job) => sum + job.price_cents, 0) / jobs.length)
+    ? Math.round(jobs.reduce((sum, job) => sum + opportunityValueCents(job), 0) / jobs.length)
     : 0;
   const upcomingJobs = jobs
     .filter((job) => job.scheduled_start && operationalStatuses.includes(job.status))
@@ -476,10 +523,12 @@ export function DashboardClient({
             {navItems.map((item) => (
               <button
                 className={activeView === item ? "active" : ""}
+                data-onboarding-target={item === "Pipeline" ? "pipeline-nav" : item === "Jobs" ? "jobs-nav" : item === "Customers" ? "customers-nav" : item === "Settings" ? "settings-nav" : undefined}
                 key={item}
                 onClick={() => {
                   if (item === "Jobs") {
                     setJobFilterMode("all");
+                    setStatusFilter("all");
                   }
                   setActiveView(item);
                   router.replace(dashboardHref(item, supportMode), { scroll: false });
@@ -532,13 +581,13 @@ export function DashboardClient({
                   />
                 </label>
               ) : null}
-              {activeView !== "Settings" && (activeView === "Customers" || customers.length === 0) ? (
+              {activeView !== "Settings" && (activeView === "Customers" || (customers.length === 0 && activeView !== "Calendar")) ? (
                 <button className="button" onClick={() => setCustomerModal("new")} type="button">
                   <span aria-hidden="true">+</span>
                   {terms.new_customer_button_label}
                 </button>
               ) : null}
-              {activeView !== "Settings" && activeView !== "Customers" && customers.length > 0 ? (
+              {activeView !== "Settings" && activeView !== "Customers" && (customers.length > 0 || activeView === "Calendar") ? (
                 <button className="button" onClick={() => setJobModal({})} type="button">
                   <span aria-hidden="true">+</span>
                   {terms.new_job_button_label}
@@ -547,7 +596,15 @@ export function DashboardClient({
             </div>
           </header>
 
-          {message ? <p className="success-message">{message}</p> : null}
+          {toastMessage ? <ToastMessage message={toastMessage} /> : null}
+          {message && !toastMessage ? <p className="success-message">{message}</p> : null}
+          {showOnboarding ? (
+            <OwnerOnboarding
+              business={business}
+              jobs={jobs}
+              terminology={terms}
+            />
+          ) : null}
 
           {activeView === "Overview" ? (
             <OverviewView
@@ -555,6 +612,7 @@ export function DashboardClient({
               completedRevenue={completedRevenue}
               counts={counts}
               dashboardWidgets={configuredDashboardWidgets}
+              openPipelineCount={jobs.filter(isOpenPipelineJob).length}
               jobs={filteredJobs}
               needsAttention={needsAttention}
               onCreateJob={() => setJobModal({})}
@@ -563,6 +621,7 @@ export function DashboardClient({
               totalPipeline={totalPipeline}
               upcomingJobs={upcomingJobs}
               averageJobValue={averageJobValue}
+              statusLabels={configuredStatusLabels}
               terminology={terms}
             />
           ) : null}
@@ -590,7 +649,9 @@ export function DashboardClient({
               attentionByJob={attentionByJob}
               jobs={filteredJobs}
               activities={activities}
+              actionPlaybooks={actionPlaybooks}
               pipelineStatuses={enabledStatuses}
+              serviceTypes={configuredServices}
               statusLabels={configuredStatusLabels}
               supportMode={supportMode}
               terminology={terms}
@@ -633,8 +694,13 @@ export function DashboardClient({
               business={business}
               dashboardWidgets={configuredDashboardWidgets}
               followupSettings={configuredFollowupSettings}
+              initialSettingsTab={initialSettingsTab}
               intakeFields={intakeFields}
+              jobs={jobs}
+              customers={customers}
+              onboardingState={onboardingState}
               pipelineStatuses={configuredPipelineStatuses}
+              actionPlaybooks={actionPlaybooks}
               serviceTypes={serviceTypes.length ? serviceTypes : configuredServices}
               supportMode={supportMode}
               terminology={terms}
@@ -677,10 +743,12 @@ function OverviewView({
   completedRevenue,
   counts,
   dashboardWidgets,
+  openPipelineCount,
   jobs,
   needsAttention,
   onCreateJob,
   pipelineStatuses,
+  statusLabels,
   supportMode,
   terminology,
   totalPipeline,
@@ -691,10 +759,12 @@ function OverviewView({
   completedRevenue: number;
   counts: Record<JobStatus, number>;
   dashboardWidgets: ReturnType<typeof normalizeDashboardWidgets>;
+  openPipelineCount: number;
   jobs: Job[];
   needsAttention: AttentionIssue[];
   onCreateJob: () => void;
   pipelineStatuses: BusinessPipelineStatus[];
+  statusLabels: Record<JobStatus, string>;
   supportMode: SupportMode;
   terminology: Terminology;
   totalPipeline: number;
@@ -704,14 +774,17 @@ function OverviewView({
 
   return (
     <>
-      <KpiGrid
-        averageJobValue={averageJobValue}
-        completedRevenue={completedRevenue}
-        counts={counts}
-        dashboardWidgets={dashboardWidgets}
-        terminology={terminology}
-        totalPipeline={totalPipeline}
-      />
+        <KpiGrid
+          averageJobValue={averageJobValue}
+          completedRevenue={completedRevenue}
+          counts={counts}
+          dashboardWidgets={dashboardWidgets}
+          openPipelineCount={openPipelineCount}
+          statusLabels={statusLabels}
+          supportMode={supportMode}
+          terminology={terminology}
+          totalPipeline={totalPipeline}
+        />
       {widgetEnabled("needs_attention") ? <NeedsAttentionPanel items={needsAttention} supportMode={supportMode} terminology={terminology} /> : null}
       <section className="content-grid">
         {widgetEnabled("active_job_board") ? <JobsPanel jobs={jobs.slice(0, 6)} pipelineStatuses={pipelineStatuses} supportMode={supportMode} terminology={terminology} title={terminology.active_board_title} /> : null}
@@ -719,6 +792,137 @@ function OverviewView({
       </section>
     </>
   );
+}
+
+function OwnerOnboarding({
+  business,
+  jobs,
+  terminology,
+}: {
+  business: Business;
+  jobs: Job[];
+  terminology: Terminology;
+}) {
+  const [phase, setPhase] = useState<"welcome" | "tour">("welcome");
+  const [step, setStep] = useState(0);
+  const [targetRect, setTargetRect] = useState<DOMRect | null>(null);
+  const finalNext = jobs.length ? "/dashboard" : "/dashboard?view=Jobs";
+  const walkthrough: {
+    copy: string;
+    target: string;
+    title: string;
+  }[] = [
+    { copy: "Start here. FlowDeck surfaces follow-ups and work that needs attention.", target: "attention-panel", title: "Dashboard" },
+    { copy: `Use Pipeline to see where ${lowerTerm(terminology.job_plural)} are stuck and what needs action.`, target: "pipeline-nav", title: "Pipeline" },
+    { copy: `Manage follow-ups, ${lowerTerm(terminology.quote_plural)}, scheduling, and active ${lowerTerm(terminology.job_plural)} here.`, target: "jobs-nav", title: terminology.job_plural },
+    { copy: "See client details, history, and related work in one place.", target: "customers-nav", title: terminology.customer_plural },
+    { copy: "Review services, stages, terminology, and the customer-facing intake form here.", target: "settings-nav", title: "Settings" },
+  ];
+  const current = walkthrough[step];
+
+  useEffect(() => {
+    if (phase !== "tour") return;
+
+    function updateTarget() {
+      const target = document.querySelector<HTMLElement>(`[data-onboarding-target="${current.target}"]`);
+      if (!target) {
+        setTargetRect(null);
+        return;
+      }
+
+      target.scrollIntoView({ block: "center", behavior: "smooth" });
+      window.setTimeout(() => setTargetRect(target.getBoundingClientRect()), 220);
+    }
+
+    updateTarget();
+    window.addEventListener("resize", updateTarget);
+    window.addEventListener("scroll", updateTarget, true);
+    return () => {
+      window.removeEventListener("resize", updateTarget);
+      window.removeEventListener("scroll", updateTarget, true);
+    };
+  }, [current.target, phase]);
+
+  if (phase === "welcome") {
+    return (
+      <div className="onboarding-backdrop" role="presentation">
+        <section className="onboarding-welcome" aria-labelledby="onboarding-welcome-title" role="dialog" aria-modal="true">
+          <div className="brand-mark">FD</div>
+          <p className="eyebrow">Welcome</p>
+          <h2 id="onboarding-welcome-title">Welcome to FlowDeck</h2>
+          <p>Here’s a quick tour so you know where everything lives.</p>
+          <span>Takes about a minute</span>
+          <div className="onboarding-button-row">
+            <form action={updateOnboardingState}>
+              <input type="hidden" name="businessId" value={business.id} />
+              <button className="button button-secondary" name="intent" type="submit" value="skip">Skip for now</button>
+            </form>
+            <button className="button" onClick={() => setPhase("tour")} type="button">Start walkthrough</button>
+          </div>
+        </section>
+      </div>
+    );
+  }
+
+  const spotlightStyle = targetRect
+    ? {
+        height: Math.round(targetRect.height + 16),
+        left: Math.round(targetRect.left - 8),
+        top: Math.round(targetRect.top - 8),
+        width: Math.round(targetRect.width + 16),
+      }
+    : undefined;
+  const popoverStyle = targetRect ? popoverPosition(targetRect) : undefined;
+
+  return (
+    <div className="tour-layer" aria-label="FlowDeck walkthrough" role="dialog" aria-modal="true">
+      <div className="tour-scrim" />
+      {targetRect ? <div className="tour-spotlight" style={spotlightStyle} /> : null}
+      <section className="tour-popover" style={popoverStyle}>
+        <span className="tour-progress">{step + 1} of {walkthrough.length}</span>
+        <h2>{current.title}</h2>
+        <p>{current.copy}</p>
+        <div className="tour-actions">
+          <button className="button button-secondary" disabled={step === 0} onClick={() => setStep((value) => Math.max(0, value - 1))} type="button">Back</button>
+          <form action={updateOnboardingState}>
+            <input type="hidden" name="businessId" value={business.id} />
+            <button className="button button-secondary" name="intent" type="submit" value="skip">Skip</button>
+          </form>
+          {step < walkthrough.length - 1 ? (
+            <button className="button" onClick={() => setStep((value) => Math.min(walkthrough.length - 1, value + 1))} type="button">Next</button>
+          ) : (
+            <form action={updateOnboardingState}>
+              <input type="hidden" name="businessId" value={business.id} />
+              <input type="hidden" name="next" value={finalNext} />
+              <button className="button" name="intent" type="submit" value="complete">Finish</button>
+            </form>
+          )}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function popoverPosition(rect: DOMRect) {
+  const width = Math.min(360, window.innerWidth - 32);
+  const spaceRight = window.innerWidth - rect.right;
+  const placeRight = spaceRight >= width + 28;
+  const placeLeft = rect.left >= width + 28;
+  const top = Math.min(Math.max(16, rect.top + rect.height / 2 - 110), window.innerHeight - 260);
+
+  if (window.innerWidth <= 760) {
+    return { bottom: 16, left: 16, right: 16 };
+  }
+
+  if (placeRight) {
+    return { left: rect.right + 20, top, width };
+  }
+
+  if (placeLeft) {
+    return { left: rect.left - width - 20, top, width };
+  }
+
+  return { left: Math.max(16, Math.min(window.innerWidth - width - 16, rect.left)), top: Math.min(rect.bottom + 18, window.innerHeight - 260), width };
 }
 
 function NeedsAttentionPanel({ items, supportMode, terminology }: { items: AttentionIssue[]; supportMode: SupportMode; terminology: Terminology }) {
@@ -734,7 +938,7 @@ function NeedsAttentionPanel({ items, supportMode, terminology }: { items: Atten
   const panelState = items.length === 0 ? "clear" : severityCounts.high > 0 && severityCounts.warning === 0 && severityCounts.info === 0 ? "critical" : "mixed";
 
   return (
-    <section className={`data-panel full-width attention-panel attention-panel-${panelState}`}>
+    <section className={`data-panel full-width attention-panel attention-panel-${panelState}`} data-onboarding-target="attention-panel">
       <div className="panel-heading">
         <div>
           <h2>Needs Attention</h2>
@@ -871,18 +1075,22 @@ function JobsView({
 
 function PipelineView({
   activities,
+  actionPlaybooks,
   attentionByJob,
   jobs,
   pipelineStatuses,
+  serviceTypes,
   statusLabels,
   supportMode,
   terminology,
   totalJobs,
 }: {
   activities: JobActivity[];
+  actionPlaybooks: BusinessActionPlaybook[];
   attentionByJob: Map<string, AttentionIssue[]>;
   jobs: Job[];
   pipelineStatuses: BusinessPipelineStatus[];
+  serviceTypes: BusinessServiceType[];
   statusLabels: Record<JobStatus, string>;
   supportMode: SupportMode;
   terminology: Terminology;
@@ -920,7 +1128,9 @@ function PipelineView({
                       issues={attentionByJob.get(job.id) ?? []}
                       job={job}
                       key={job.id}
+                      playbooks={actionPlaybooks}
                       pipelineStatuses={pipelineStatuses}
+                      serviceTypes={serviceTypes}
                       stageAge={stageAgeLabel(job, activities)}
                       statusLabels={statusLabels}
                       supportMode={supportMode}
@@ -949,7 +1159,7 @@ function stageOpenValue(status: JobStatus, jobs: Job[]) {
     return 0;
   }
 
-  return jobs.reduce((sum, job) => sum + job.price_cents, 0);
+  return jobs.reduce((sum, job) => sum + openPipelineValueCents(job), 0);
 }
 
 function stageEnteredAt(job: Job, activities: JobActivity[]) {
@@ -1022,7 +1232,9 @@ function sortPipelineJobs(jobs: Job[], attentionByJob: Map<string, AttentionIssu
 function PipelineCard({
   issues,
   job,
+  playbooks,
   pipelineStatuses,
+  serviceTypes,
   stageAge,
   statusLabels,
   supportMode,
@@ -1030,13 +1242,16 @@ function PipelineCard({
 }: {
   issues: AttentionIssue[];
   job: Job;
+  playbooks: BusinessActionPlaybook[];
   pipelineStatuses: BusinessPipelineStatus[];
+  serviceTypes: BusinessServiceType[];
   stageAge: string;
   statusLabels: Record<JobStatus, string>;
   supportMode: SupportMode;
   terminology: Terminology;
 }) {
   const scheduledText = job.scheduled_start ? `${dateLabel(job.scheduled_start)} at ${timeLabel(job.scheduled_start)}` : null;
+  const recommendation = resolvePlaybookForJob(job, playbooks, serviceTypes).actions[0] ?? null;
 
   return (
     <article className="pipeline-card">
@@ -1046,7 +1261,7 @@ function PipelineCard({
           <h3>{job.title}</h3>
         </div>
         <div className="pipeline-card-facts">
-          <span>{money(job.price_cents)}</span>
+          <span>{money(opportunityValueCents(job))}</span>
           <span>{sourceLabels[job.source]}</span>
           {scheduledText && (job.status === "scheduled" || job.status === "in_progress" || job.status === "completed") ? (
             <span>{scheduledText}</span>
@@ -1055,6 +1270,7 @@ function PipelineCard({
         <span className={isStale(job) ? "age-chip stale" : "age-chip"}>{stageAge}</span>
       </Link>
       <AttentionIndicator issues={issues} supportMode={supportMode} />
+      {recommendation ? <PipelineRecommendation action={recommendation} job={job} supportMode={supportMode} terminology={terminology} /> : null}
       <PipelineQuickActions issues={issues} job={job} supportMode={supportMode} terminology={terminology} />
       {job.status === "lost" ? (
         <span className={`status-pill status-${job.status}`}>{statusLabels[job.status]}</span>
@@ -1078,6 +1294,95 @@ function PipelineCard({
         </form>
       )}
     </article>
+  );
+}
+
+function PipelineRecommendation({ action, job, supportMode, terminology }: { action: BusinessActionPlaybook; job: Job; supportMode: SupportMode; terminology: Terminology }) {
+  return (
+    <div className="pipeline-recommendation">
+      <span>Recommended</span>
+      <PlaybookActionControl action={action} compact job={job} supportMode={supportMode} terminology={terminology} />
+    </div>
+  );
+}
+
+function PlaybookActionControl({
+  action,
+  compact = false,
+  job,
+  supportMode,
+  terminology,
+}: {
+  action: BusinessActionPlaybook;
+  compact?: boolean;
+  job: Job;
+  supportMode: SupportMode;
+  terminology: Terminology;
+}) {
+  const className = compact ? "link-button" : "button button-secondary";
+  const customer = job.customer;
+
+  if (action.action_type === "call") {
+    return customer?.phone ? (
+      <a className={className} href={`tel:${customer.phone}`}>
+        {action.action_label}
+      </a>
+    ) : (
+      <Link className={className} href={scopedHref(`/jobs/${job.id}?edit=1#edit-job`, supportMode)}>
+        Add phone
+      </Link>
+    );
+  }
+
+  if (action.action_type === "email") {
+    return customer?.email ? (
+      <a className={className} href={`mailto:${customer.email}`}>
+        {action.action_label}
+      </a>
+    ) : (
+      <Link className={className} href={scopedHref(`/jobs/${job.id}?edit=1#edit-job`, supportMode)}>
+        Add email
+      </Link>
+    );
+  }
+
+  if (action.action_type === "mark_contacted") {
+    return (
+      <form action={markJobContacted}>
+        <input type="hidden" name="jobId" value={job.id} />
+        <input type="hidden" name="returnTo" value={scopedHref(`/jobs/${job.id}`, supportMode)} />
+        <SupportModeInput supportMode={supportMode} />
+        <button className={className} type="submit">
+          {action.action_label}
+        </button>
+      </form>
+    );
+  }
+
+  if (action.action_type === "set_follow_up") {
+    return <Link className={className} href={scopedHref(`/jobs/${job.id}#quick-actions`, supportMode)}>{action.action_label}</Link>;
+  }
+
+  if (action.action_type === "schedule") {
+    return <Link className={className} href={scopedHref(`/jobs/${job.id}?edit=1#edit-job`, supportMode)}>{action.action_label}</Link>;
+  }
+
+  if (action.action_type === "review_proposal") {
+    return <Link className={className} href={scopedHref(`/jobs/${job.id}#quote`, supportMode)}>{action.action_label}</Link>;
+  }
+
+  if (action.action_type === "mark_lost") {
+    return <Link className={className} href={scopedHref(`/jobs/${job.id}#quick-actions`, supportMode)}>{action.action_label}</Link>;
+  }
+
+  if (action.action_type === "custom_instruction") {
+    return <span className={compact ? "playbook-instruction compact" : "playbook-instruction"}>{action.action_label}</span>;
+  }
+
+  return (
+    <Link className={className} href={scopedHref(`/jobs/${job.id}`, supportMode)}>
+      {action.action_label || `Open ${terminology.job_singular}`}
+    </Link>
   );
 }
 
@@ -1222,6 +1527,14 @@ function JobsPanel({
   const router = useRouter();
   const statusLabelMap = Object.fromEntries(pipelineStatuses.map((status) => [status.semantic_type, status.label])) as Record<JobStatus, string>;
   const showAttentionFilter = Boolean(setJobFilterMode && setStatusFilter && setSort);
+  const currentStatusFilter = statusFilter ?? "all";
+  let activeFilterLabel: string | null = null;
+
+  if (jobFilterMode === "open-pipeline") {
+    activeFilterLabel = "Open Pipeline";
+  } else if (currentStatusFilter !== "all") {
+    activeFilterLabel = statusLabelMap[currentStatusFilter];
+  }
 
   return (
     <div className={fullWidth ? "data-panel jobs-panel full-width" : "data-panel jobs-panel"}>
@@ -1234,8 +1547,13 @@ function JobsPanel({
           <div className="table-controls">
             <select
               aria-label="Filter by status"
-              onChange={(event) => setStatusFilter(event.target.value as "all" | JobStatus)}
-              value={statusFilter}
+              onChange={(event) => {
+                const nextStatus = event.target.value as "all" | JobStatus;
+                setJobFilterMode?.("all");
+                setStatusFilter(nextStatus);
+                router.replace(nextStatus === "all" ? dashboardHref("Jobs", supportMode ?? null) : dashboardHref("Jobs", supportMode ?? null, nextStatus), { scroll: false });
+              }}
+              value={currentStatusFilter}
             >
               <option value="all">All statuses</option>
               {pipelineStatuses.map((status) => (
@@ -1259,6 +1577,7 @@ function JobsPanel({
             className={jobFilterMode === "all" ? "active" : ""}
             onClick={() => {
               setJobFilterMode?.("all");
+              setStatusFilter?.("all");
               router.replace(dashboardHref("Jobs", supportMode ?? null), { scroll: false });
             }}
             type="button"
@@ -1269,12 +1588,25 @@ function JobsPanel({
             className={jobFilterMode === "needs-attention" ? "active attention-filter" : "attention-filter"}
             onClick={() => {
               setJobFilterMode?.("needs-attention");
+              setStatusFilter?.("all");
               router.replace(dashboardHref("Jobs", supportMode ?? null, "needs-attention"), { scroll: false });
             }}
             type="button"
           >
             Needs Attention <span>{attentionFilterCount}</span>
           </button>
+          <button
+            className={jobFilterMode === "open-pipeline" ? "active" : ""}
+            onClick={() => {
+              setJobFilterMode?.("open-pipeline");
+              setStatusFilter?.("all");
+              router.replace(dashboardHref("Jobs", supportMode ?? null, "open-pipeline"), { scroll: false });
+            }}
+            type="button"
+          >
+            Open Pipeline
+          </button>
+          {activeFilterLabel ? <span className="active-filter-note">Showing {activeFilterLabel}</span> : null}
         </div>
       ) : null}
 
@@ -1346,7 +1678,7 @@ function JobsPanel({
                     {dateLabel(job.scheduled_start)}
                     {job.scheduled_start ? <span>{timeLabel(job.scheduled_start)}</span> : null}
                   </td>
-                  <td className="numeric-cell">{money(job.price_cents)}</td>
+                  <td className="numeric-cell">{money(opportunityValueCents(job))}</td>
                   <td className="muted-cell">{dateLabel(job.updated_at)}</td>
                   <td className="row-arrow" aria-hidden="true">
                     &rarr;
@@ -1376,6 +1708,9 @@ function KpiGrid({
   completedRevenue,
   counts,
   dashboardWidgets,
+  openPipelineCount,
+  statusLabels,
+  supportMode,
   terminology = normalizeTerminology(),
   totalPipeline,
 }: {
@@ -1383,6 +1718,9 @@ function KpiGrid({
   completedRevenue: number;
   counts: Record<JobStatus, number>;
   dashboardWidgets?: ReturnType<typeof normalizeDashboardWidgets>;
+  openPipelineCount: number;
+  statusLabels: Record<JobStatus, string>;
+  supportMode: SupportMode;
   terminology?: Terminology;
   totalPipeline: number;
 }) {
@@ -1398,6 +1736,23 @@ function KpiGrid({
     quoted: counts.quoted,
     scheduled: counts.scheduled,
     upcoming: "",
+  };
+  const filters: Partial<Record<DashboardWidgetKey, DashboardFilter>> = {
+    avg_job: "all",
+    completed: "completed",
+    in_progress: "in_progress",
+    new_leads: "lead",
+    open_pipeline: "open-pipeline",
+    quoted: "quoted",
+    scheduled: "scheduled",
+  };
+  const helpers: Partial<Record<DashboardWidgetKey, string>> = {
+    completed: money(completedRevenue),
+    in_progress: statusLabels.in_progress,
+    new_leads: "Needs first response",
+    open_pipeline: `${pluralize(openPipelineCount, lowerTerm(terminology.job_singular), lowerTerm(terminology.job_plural))} contributing`,
+    quoted: "Awaiting answer",
+    scheduled: statusLabels.scheduled,
   };
   const icons: Record<DashboardWidgetKey, React.ReactNode> = {
     active_job_board: <ProgressIcon />,
@@ -1420,7 +1775,8 @@ function KpiGrid({
         <div className="kpi-grid kpi-grid-primary">
           {primary.map((widget) => (
             <KpiCard
-              helper={widget.widget_key === "completed" ? money(completedRevenue) : widget.helper}
+              helper={helpers[widget.widget_key] ?? widget.helper}
+              href={dashboardHref("Jobs", supportMode, filters[widget.widget_key] ?? "all")}
               icon={icons[widget.widget_key]}
               key={widget.widget_key}
               label={widgetLabel(widget, terminology)}
@@ -1434,7 +1790,8 @@ function KpiGrid({
         <div className="kpi-secondary-row">
           {secondary.map((widget) => (
             <KpiCard
-              helper={widget.widget_key === "completed" ? money(completedRevenue) : widget.helper}
+              helper={helpers[widget.widget_key] ?? widget.helper}
+              href={dashboardHref("Jobs", supportMode, filters[widget.widget_key] ?? "all")}
               icon={icons[widget.widget_key]}
               key={widget.widget_key}
               label={widgetLabel(widget, terminology)}
@@ -1627,57 +1984,56 @@ function CalendarView({
   const operationalJobs = jobs.filter((job) => job.scheduled_start && operationalStatuses.includes(job.status));
   const tentativeJobs = jobs.filter((job) => job.scheduled_start && job.status === "quoted");
   const rangeLabel = calendarRangeLabel(calendarDate, mode);
+  const visibleUpcoming = operationalJobs
+    .filter((job) => job.scheduled_start && new Date(job.scheduled_start) >= startOfDay(new Date()))
+    .sort((a, b) => String(a.scheduled_start).localeCompare(String(b.scheduled_start)))
+    .slice(0, 5);
 
   return (
-    <section className="data-panel full-width calendar-panel">
-      <div className="panel-heading calendar-heading">
-        <div>
-          <h2>Schedule</h2>
-          <p className="muted">Confirmed scheduled and in-progress work appears on the operating calendar.</p>
-        </div>
-        <div className="calendar-controls">
-          <div className="segmented-control" aria-label="Calendar view">
-            {(["Week", "Month", "Agenda"] as CalendarMode[]).map((value) => (
-              <button className={mode === value ? "active" : ""} key={value} onClick={() => onModeChange(value)} type="button">
-                {value}
-              </button>
-            ))}
-          </div>
-          <button className="button button-secondary" onClick={() => onMove(-1)} type="button">
-            Prev
-          </button>
+    <section className="calendar-workspace">
+      <div className="calendar-topbar">
+        <div className="calendar-period-controls">
           <button className="button button-secondary" onClick={onToday} type="button">
             Today
           </button>
-          <button className="button button-secondary" onClick={() => onMove(1)} type="button">
-            Next
-          </button>
+          <div className="calendar-arrow-group">
+            <button className="icon-button" aria-label="Previous period" onClick={() => onMove(-1)} type="button">
+              ‹
+            </button>
+            <button className="icon-button" aria-label="Next period" onClick={() => onMove(1)} type="button">
+              ›
+            </button>
+          </div>
+          <strong>{rangeLabel}</strong>
+        </div>
+        <div className="segmented-control calendar-mode-control" aria-label="Calendar view">
+          {(["Week", "Month", "Agenda"] as CalendarMode[]).map((value) => (
+            <button className={mode === value ? "active" : ""} key={value} onClick={() => onModeChange(value)} type="button">
+              {value}
+            </button>
+          ))}
         </div>
       </div>
 
-      <div className="calendar-range">{rangeLabel}</div>
-      {mode === "Week" ? <WeekCalendar date={calendarDate} jobs={operationalJobs} onCreateJob={onCreateJob} supportMode={supportMode} /> : null}
-      {mode === "Month" ? <MonthCalendar date={calendarDate} jobs={operationalJobs} supportMode={supportMode} /> : null}
-      {mode === "Agenda" ? <AgendaCalendar jobs={operationalJobs} supportMode={supportMode} /> : null}
-
-      {tentativeJobs.length ? (
-        <div className="tentative-list">
-          <h3>Tentative quotes</h3>
-          <p className="muted">Quoted jobs with dates are listed separately until they are scheduled.</p>
-          <div>
-            {tentativeJobs.slice(0, 5).map((job) => (
-              <Link className="tentative-item" href={scopedHref(`/jobs/${job.id}`, supportMode)} key={job.id}>
-                <span>{dateLabel(job.scheduled_start)}</span>
-                <strong>{job.customer?.name ?? "Customer"}</strong>
-                <span>{job.title}</span>
-              </Link>
-            ))}
-          </div>
+      <div className="calendar-layout">
+        <div className="calendar-main-panel">
+          {mode === "Week" ? <WeekCalendar date={calendarDate} jobs={operationalJobs} onCreateJob={onCreateJob} supportMode={supportMode} /> : null}
+          {mode === "Month" ? <MonthCalendar date={calendarDate} jobs={operationalJobs} supportMode={supportMode} /> : null}
+          {mode === "Agenda" ? <AgendaCalendar jobs={operationalJobs} supportMode={supportMode} /> : null}
         </div>
-      ) : null}
+        <CalendarSidePanel
+          date={calendarDate}
+          jobs={visibleUpcoming}
+          onCreateJob={onCreateJob}
+          supportMode={supportMode}
+          tentativeJobs={tentativeJobs}
+        />
+      </div>
     </section>
   );
 }
+
+const calendarHours = Array.from({ length: 10 }, (_, index) => index + 8);
 
 function WeekCalendar({
   date,
@@ -1692,24 +2048,46 @@ function WeekCalendar({
 }) {
   const first = startOfWeek(date);
   const days = Array.from({ length: 7 }, (_, index) => addDays(first, index));
+  const today = new Date();
 
   return (
-    <div className="week-grid">
+    <div className="week-schedule-grid">
+      <div className="week-corner" />
+      {days.map((day) => (
+        <button className={sameDate(day, today) ? "week-day-head today" : "week-day-head"} key={day.toISOString()} onClick={() => onCreateJob(day)} type="button">
+          <span>{new Intl.DateTimeFormat("en-US", { timeZone: "UTC", weekday: "short" }).format(day)}</span>
+          <strong>{day.getUTCDate()}</strong>
+        </button>
+      ))}
+      <div className="week-time-rail">
+        <span>All day</span>
+        {calendarHours.map((hour) => (
+          <span key={hour}>{hour === 12 ? "12 PM" : hour < 12 ? `${hour} AM` : `${hour - 12} PM`}</span>
+        ))}
+      </div>
       {days.map((day) => {
         const dayJobs = jobs.filter((job) => job.scheduled_start && sameDate(new Date(job.scheduled_start), day));
         return (
-          <div className="calendar-day" key={day.toISOString()}>
-            <button className="day-head" onClick={() => onCreateJob(day)} type="button">
-              <span>{new Intl.DateTimeFormat("en-US", { timeZone: "UTC", weekday: "short" }).format(day)}</span>
-              <strong>{day.getUTCDate()}</strong>
+          <div className={sameDate(day, today) ? "week-day-column today" : "week-day-column"} key={`body-${day.toISOString()}`}>
+            <button className="calendar-add-slot" onClick={() => onCreateJob(day)} type="button">
+              + Add event
             </button>
-            <div className="day-events">
-              {dayJobs.length ? (
-                dayJobs.map((job) => <CalendarEvent job={job} key={job.id} supportMode={supportMode} />)
-              ) : (
-                <span className="no-events">Open</span>
-              )}
-            </div>
+            {calendarHours.map((hour) => (
+              <button
+                aria-label={`Add event at ${hour}:00`}
+                className="week-hour-slot"
+                key={hour}
+                onClick={() => {
+                  const scheduled = new Date(day);
+                  scheduled.setUTCHours(hour, 0, 0, 0);
+                  onCreateJob(scheduled);
+                }}
+                type="button"
+              />
+            ))}
+            {dayJobs.map((job, index) => (
+              <CalendarEvent job={job} key={job.id} style={calendarEventStyle(job, index)} supportMode={supportMode} />
+            ))}
           </div>
         );
       })}
@@ -1721,18 +2099,22 @@ function MonthCalendar({ date, jobs, supportMode }: { date: Date; jobs: Job[]; s
   const firstOfMonth = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1));
   const first = startOfWeek(firstOfMonth);
   const days = Array.from({ length: 42 }, (_, index) => addDays(first, index));
+  const today = new Date();
 
   return (
-    <div className="month-grid">
+    <div className="month-calendar-grid">
+      {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((day) => (
+        <span className="month-weekday" key={day}>{day}</span>
+      ))}
       {days.map((day) => {
         const dayJobs = jobs.filter((job) => job.scheduled_start && sameDate(new Date(job.scheduled_start), day));
         return (
-          <div className={day.getUTCMonth() === date.getUTCMonth() ? "month-day" : "month-day muted-day"} key={day.toISOString()}>
+          <div className={`${day.getUTCMonth() === date.getUTCMonth() ? "month-day" : "month-day muted-day"}${sameDate(day, today) ? " today" : ""}`} key={day.toISOString()}>
             <strong>{day.getUTCDate()}</strong>
-            {dayJobs.slice(0, 2).map((job) => (
+            {dayJobs.slice(0, 3).map((job) => (
               <CalendarEvent compact job={job} key={job.id} supportMode={supportMode} />
             ))}
-            {dayJobs.length > 2 ? <span className="more-events">+{dayJobs.length - 2} more</span> : null}
+            {dayJobs.length > 3 ? <span className="more-events">+{dayJobs.length - 3} more</span> : null}
           </div>
         );
       })}
@@ -1760,12 +2142,12 @@ function AgendaCalendar({ jobs, supportMode }: { jobs: Job[]; supportMode: Suppo
   }
 
   return (
-    <div className="agenda-list">
+    <div className="agenda-list polished-agenda-list">
       {Object.entries(groups).map(([day, dayJobs]) => (
         <section key={day}>
           <h3>{day}</h3>
           {dayJobs.map((job) => (
-            <CalendarEvent job={job} key={job.id} supportMode={supportMode} />
+            <CalendarEvent agenda job={job} key={job.id} supportMode={supportMode} />
           ))}
         </section>
       ))}
@@ -1773,9 +2155,109 @@ function AgendaCalendar({ jobs, supportMode }: { jobs: Job[]; supportMode: Suppo
   );
 }
 
-function CalendarEvent({ compact = false, job, supportMode }: { compact?: boolean; job: Job; supportMode: SupportMode }) {
+function CalendarSidePanel({
+  date,
+  jobs,
+  onCreateJob,
+  supportMode,
+  tentativeJobs,
+}: {
+  date: Date;
+  jobs: Job[];
+  onCreateJob: (scheduledStart?: Date) => void;
+  supportMode: SupportMode;
+  tentativeJobs: Job[];
+}) {
+  const firstOfMonth = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1));
+  const first = startOfWeek(firstOfMonth);
+  const days = Array.from({ length: 42 }, (_, index) => addDays(first, index));
+  const today = new Date();
+
   return (
-    <Link className={compact ? `calendar-event compact status-${job.status}` : `calendar-event status-${job.status}`} href={scopedHref(`/jobs/${job.id}`, supportMode)}>
+    <aside className="calendar-side-panel">
+      <section className="mini-calendar-card">
+        <div className="mini-calendar-head">
+          <strong>{new Intl.DateTimeFormat("en-US", { month: "long", timeZone: "UTC", year: "numeric" }).format(date)}</strong>
+          <span aria-hidden="true">‹ ›</span>
+        </div>
+        <div className="mini-calendar-grid">
+          {["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"].map((day) => (
+            <span className="mini-weekday" key={day}>{day}</span>
+          ))}
+          {days.map((day) => (
+            <span className={`${day.getUTCMonth() === date.getUTCMonth() ? "" : "muted"}${sameDate(day, today) ? " active" : ""}`} key={day.toISOString()}>
+              {day.getUTCDate()}
+            </span>
+          ))}
+        </div>
+      </section>
+
+      <section className="upcoming-calendar-card">
+        <div className="calendar-side-heading">
+          <h3>Upcoming this week</h3>
+          <button onClick={() => onCreateJob()} type="button">New</button>
+        </div>
+        <div className="calendar-side-list">
+          {jobs.length ? jobs.map((job) => (
+            <Link className={`calendar-side-item status-${job.status}`} href={scopedHref(`/jobs/${job.id}`, supportMode)} key={job.id}>
+              <span>{timeLabel(job.scheduled_start)}</span>
+              <strong>{job.customer?.name ?? "Customer"}</strong>
+              <em>{job.title}</em>
+              <b aria-hidden="true">›</b>
+            </Link>
+          )) : <p className="muted">No confirmed work coming up.</p>}
+        </div>
+      </section>
+
+      {tentativeJobs.length ? (
+        <section className="upcoming-calendar-card tentative-card">
+          <div className="calendar-side-heading">
+            <h3>Tentative quotes</h3>
+          </div>
+          <div className="calendar-side-list">
+            {tentativeJobs.slice(0, 4).map((job) => (
+              <Link className="calendar-side-item status-quoted" href={scopedHref(`/jobs/${job.id}`, supportMode)} key={job.id}>
+                <span>{dateLabel(job.scheduled_start)}</span>
+                <strong>{job.customer?.name ?? "Customer"}</strong>
+                <em>{job.title}</em>
+                <b aria-hidden="true">›</b>
+              </Link>
+            ))}
+          </div>
+        </section>
+      ) : null}
+    </aside>
+  );
+}
+
+function calendarEventStyle(job: Job, index: number) {
+  const start = job.scheduled_start ? new Date(job.scheduled_start) : null;
+  const end = job.scheduled_end ? new Date(job.scheduled_end) : null;
+  if (!start) {
+    return undefined;
+  }
+  const startHour = start.getUTCHours() + start.getUTCMinutes() / 60;
+  const endHour = end ? end.getUTCHours() + end.getUTCMinutes() / 60 : startHour + 1;
+  const top = Math.max(42, 42 + (startHour - 8) * 54);
+  const height = Math.max(48, (Math.max(endHour, startHour + 1) - startHour) * 54 - 7);
+
+  return {
+    height,
+    left: `${8 + (index % 2) * 4}px`,
+    right: `${8 + (index % 2) * 4}px`,
+    top,
+  };
+}
+
+function CalendarEvent({ agenda = false, compact = false, job, style, supportMode }: { agenda?: boolean; compact?: boolean; job: Job; style?: React.CSSProperties; supportMode: SupportMode }) {
+  const className = agenda
+    ? `calendar-event agenda-event status-${job.status}`
+    : compact
+      ? `calendar-event compact status-${job.status}`
+      : `calendar-event status-${job.status}`;
+
+  return (
+    <Link className={className} href={scopedHref(`/jobs/${job.id}`, supportMode)} style={style}>
       <span>{timeLabel(job.scheduled_start)}</span>
       <strong>{job.customer?.name ?? "Customer"}</strong>
       <span>{job.title}</span>
@@ -1811,6 +2293,9 @@ function AnalyticsView({
         averageJobValue={averageJobValue}
         completedRevenue={completedRevenue}
         counts={counts}
+        openPipelineCount={jobs.filter(isOpenPipelineJob).length}
+        statusLabels={statusLabels}
+        supportMode={null}
         terminology={terminology}
         totalPipeline={totalPipeline}
       />
@@ -1884,8 +2369,8 @@ function buildSourcePerformance(jobs: Job[]) {
       const sourceJobs = jobs.filter((job) => job.source === source);
       const leads = sourceJobs.length;
       const contacted = sourceJobs.filter((job) => job.first_contact_at || job.status !== "lead").length;
-      const wonJobs = sourceJobs.filter((job) => job.status !== "lost" && (job.won_at || job.completed_at || job.status === "completed"));
-      const revenue = wonJobs.reduce((sum, job) => sum + job.revenue_cents, 0);
+      const wonJobs = sourceJobs.filter((job) => wonValueCents(job) > 0 || job.status === "completed");
+      const revenue = sourceJobs.reduce((sum, job) => sum + completedRevenueCents(job), 0);
 
       return {
         contacted,
@@ -1900,29 +2385,94 @@ function buildSourcePerformance(jobs: Job[]) {
 }
 
 function SettingsView({
+  actionPlaybooks,
   business,
   dashboardWidgets,
   followupSettings,
+  initialSettingsTab,
   intakeFields,
+  jobs,
+  customers,
+  onboardingState,
   pipelineStatuses,
   serviceTypes,
   supportMode,
   terminology,
 }: {
+  actionPlaybooks: BusinessActionPlaybook[];
   business: Business;
   dashboardWidgets: ReturnType<typeof normalizeDashboardWidgets>;
   followupSettings: ReturnType<typeof normalizeFollowupSettings>;
+  initialSettingsTab?: SettingsTab;
   intakeFields: IntakeField[];
+  jobs: Job[];
+  customers: CustomerSummary[];
+  onboardingState: BusinessOnboardingState | null;
   pipelineStatuses: BusinessPipelineStatus[];
   serviceTypes: BusinessServiceType[];
   supportMode: SupportMode;
   terminology: Terminology;
 }) {
-  const [settingsTab, setSettingsTab] = useState<"Workspace" | "Terminology" | "Services" | "Pipeline" | "Dashboard" | "Public intake">("Workspace");
+  const router = useRouter();
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>(initialSettingsTab ?? "Workspace");
   const intakePath = business.slug ? `/intake/${business.slug}` : "";
   const enabledFieldCount = intakeFields.filter((field) => field.enabled).length;
   const enabledServiceCount = serviceTypes.filter((service) => service.enabled).length;
   const enabledDashboardCount = dashboardWidgets.filter((widget) => widget.enabled).length;
+  const openOpportunityCount = jobs.filter(isOpenPipelineJob).length;
+  const pipelineValue = jobs.filter(isOpenPipelineJob).reduce((sum, job) => sum + openPipelineValueCents(job), 0);
+  const settingsSections: Array<{ description: string; eyebrow: string; icon: SettingsIconName; label: SettingsTab; meta: string }> = [
+    {
+      description: "Business identity, onboarding, and follow-up timing.",
+      eyebrow: followupSettings.reminders_enabled ? "Automation on" : "Automation paused",
+      icon: "workspace",
+      label: "Workspace",
+      meta: onboardingState?.completed_at ? "Tour complete" : onboardingState?.skipped_at ? "Tour skipped" : "Tour available",
+    },
+    {
+      description: "Rename the core objects your team and customers see.",
+      eyebrow: "Language",
+      icon: "terminology",
+      label: "Terminology",
+      meta: `${terminology.job_plural} / ${terminology.customer_plural}`,
+    },
+    {
+      description: "Manage the services shown in jobs and public intake.",
+      eyebrow: "Catalog",
+      icon: "services",
+      label: "Services",
+      meta: pluralize(enabledServiceCount, "active service"),
+    },
+    {
+      description: "Control visible stages while keeping workflow meaning stable.",
+      eyebrow: "Workflow",
+      icon: "pipeline",
+      label: "Pipeline",
+      meta: pluralize(pipelineStatuses.filter((status) => status.enabled).length, "visible stage"),
+    },
+    {
+      description: "Choose what appears on the Overview dashboard.",
+      eyebrow: "Overview",
+      icon: "dashboard",
+      label: "Dashboard",
+      meta: pluralize(enabledDashboardCount, "visible item"),
+    },
+    {
+      description: "Shape the customer-facing request form and extra questions.",
+      eyebrow: "Public form",
+      icon: "intake",
+      label: "Public intake",
+      meta: pluralize(enabledFieldCount, "custom field"),
+    },
+    {
+      description: "Decide what your team should do next at each stage.",
+      eyebrow: "Guidance",
+      icon: "steps",
+      label: "Team Steps",
+      meta: pluralize(actionPlaybooks.filter((action) => action.is_enabled).length, "active step"),
+    },
+  ];
+  const activeSettingsSection = settingsSections.find((section) => section.label === settingsTab) ?? settingsSections[0];
 
   async function copyIntakeLink() {
     if (!intakePath) {
@@ -1932,15 +2482,54 @@ function SettingsView({
     await navigator.clipboard?.writeText(`${window.location.origin}${intakePath}`);
   }
 
+  function selectSettingsTab(tab: SettingsTab) {
+    setSettingsTab(tab);
+    router.replace(settingsHref(tab, supportMode), { scroll: false });
+  }
+
   return (
-    <div className="settings-stack">
-      <div className="settings-tabs" role="tablist" aria-label="Settings sections">
-        {(["Workspace", "Terminology", "Services", "Pipeline", "Dashboard", "Public intake"] as const).map((tab) => (
-          <button className={settingsTab === tab ? "active" : ""} key={tab} onClick={() => setSettingsTab(tab)} role="tab" type="button">
-            {tab}
-          </button>
-        ))}
+    <div className="settings-workspace-shell">
+      <div className="settings-product-nav" role="tablist" aria-label="Settings sections">
+          {settingsSections.map((section) => (
+            <Link
+              aria-selected={settingsTab === section.label}
+              className={settingsTab === section.label ? "active" : ""}
+              href={settingsHref(section.label, supportMode)}
+              key={section.label}
+              onClick={() => selectSettingsTab(section.label)}
+              role="tab"
+            >
+              <SettingsSectionIcon type={section.icon} />
+              <span>
+                <strong>{section.label}</strong>
+              </span>
+            </Link>
+          ))}
       </div>
+
+      <SettingsSummaryBanner
+        business={business}
+        customerCount={customers.length}
+        openOpportunityCount={openOpportunityCount}
+        pipelineValue={pipelineValue}
+        terminology={terminology}
+      />
+
+      <div className="settings-content-grid">
+        <div className="settings-workbench">
+          <header className="settings-workbench-header">
+            <span className="settings-module-icon">
+              <SettingsSectionIcon type={activeSettingsSection.icon} />
+            </span>
+            <div>
+              <p>{activeSettingsSection.eyebrow}</p>
+              <h2>{activeSettingsSection.label}</h2>
+              <span>{activeSettingsSection.description}</span>
+            </div>
+            <strong>{activeSettingsSection.meta}</strong>
+          </header>
+
+          <div className="settings-module-stack">
 
       {settingsTab === "Workspace" ? (
       <section className="data-panel settings-panel">
@@ -1956,6 +2545,24 @@ function SettingsView({
             <input id="businessName" name="name" defaultValue={business.name} required />
           </div>
           <SubmitButton>Save settings</SubmitButton>
+        </form>
+      </section>
+      ) : null}
+
+      {settingsTab === "Workspace" && !supportMode && onboardingState ? (
+      <section className="data-panel settings-panel">
+        <div className="panel-heading">
+          <div>
+            <h2>Getting Started</h2>
+            <p className="muted">Restart the lightweight welcome checklist and product walkthrough.</p>
+          </div>
+          <span className={onboardingState?.completed_at || onboardingState?.skipped_at ? "status-pill status-scheduled" : "status-pill"}>
+            {onboardingState?.completed_at ? "Completed" : onboardingState?.skipped_at ? "Skipped" : "Available"}
+          </span>
+        </div>
+        <form action={updateOnboardingState}>
+          <input type="hidden" name="businessId" value={business.id} />
+          <button className="button button-secondary" name="intent" type="submit" value="restart">Restart walkthrough</button>
         </form>
       </section>
       ) : null}
@@ -2358,7 +2965,310 @@ function SettingsView({
         </details>
       </section>
       ) : null}
+
+      {settingsTab === "Team Steps" ? (
+      <ActionPlaybooksSettings
+        actionPlaybooks={actionPlaybooks}
+        business={business}
+        pipelineStatuses={pipelineStatuses}
+        serviceTypes={serviceTypes}
+        supportMode={supportMode}
+        terminology={terminology}
+      />
+      ) : null}
+          </div>
+        </div>
+      </div>
     </div>
+  );
+}
+
+type SettingsIconName = "dashboard" | "intake" | "pipeline" | "services" | "steps" | "terminology" | "workspace";
+
+function SettingsSummaryBanner({
+  business,
+  customerCount,
+  openOpportunityCount,
+  pipelineValue,
+  terminology,
+}: {
+  business: Business;
+  customerCount: number;
+  openOpportunityCount: number;
+  pipelineValue: number;
+  terminology: Terminology;
+}) {
+  return (
+    <section className="settings-summary-banner" aria-label="Workspace summary">
+      <div className="settings-summary-identity">
+        <span className="settings-summary-mark">FD</span>
+        <div>
+          <h2>{displayWorkspaceName(business.name)}</h2>
+          <p>Manage workspace settings and preferences.</p>
+        </div>
+        <span className={business.intake_form_enabled ? "settings-summary-status active" : "settings-summary-status"}>
+          {business.intake_form_enabled ? "Active" : "Intake paused"}
+        </span>
+      </div>
+      <div className="settings-summary-stats">
+        <div>
+          <span>{openOpportunityCount}</span>
+          <p>Open {lowerTerm(terminology.job_plural)}</p>
+        </div>
+        <div>
+          <span>{customerCount}</span>
+          <p>{terminology.customer_plural}</p>
+        </div>
+        <div>
+          <span>{money(pipelineValue)}</span>
+          <p>Pipeline value</p>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function SettingsSectionIcon({ type }: { type: SettingsIconName }) {
+  const paths: Record<SettingsIconName, string> = {
+    dashboard: "M4 13h6v7H4Zm10-9h6v16h-6ZM4 4h6v5H4Z",
+    intake: "M7 3h7l4 4v14H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Zm7 0v5h5M8 13h8M8 17h6",
+    pipeline: "M4 7h5v10H4Zm8-3h5v16h-5Zm8 6h5v7h-5",
+    services: "M12 21s-7-4.4-7-10a4 4 0 0 1 7-2.6A4 4 0 0 1 19 11c0 5.6-7 10-7 10Z",
+    steps: "M6 6h12M6 12h12M6 18h12M3 6h.01M3 12h.01M3 18h.01",
+    terminology: "M4 6h16M4 12h10M4 18h13M8 6v12",
+    workspace: "M4 21V7l8-4 8 4v14M9 21v-8h6v8M4 10h16",
+  };
+
+  return (
+    <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24">
+      <path d={paths[type]} />
+    </svg>
+  );
+}
+
+function ActionPlaybooksSettings({
+  actionPlaybooks,
+  business,
+  pipelineStatuses,
+  serviceTypes,
+  supportMode,
+  terminology,
+}: {
+  actionPlaybooks: BusinessActionPlaybook[];
+  business: Business;
+  pipelineStatuses: BusinessPipelineStatus[];
+  serviceTypes: BusinessServiceType[];
+  supportMode: SupportMode;
+  terminology: Terminology;
+}) {
+  const [pipelineKey, setPipelineKey] = useState<JobStatus>(pipelineStatuses[0]?.semantic_type ?? "lead");
+  const [customizeService, setCustomizeService] = useState(false);
+  const [serviceTypeId, setServiceTypeId] = useState("");
+  const [addingStep, setAddingStep] = useState(false);
+  const [newActionType, setNewActionType] = useState<ActionPlaybookType>("call");
+  const selectedActions = actionPlaybooks
+    .filter((action) => action.pipeline_key === pipelineKey && (customizeService && serviceTypeId ? action.service_type_id === serviceTypeId : !action.service_type_id))
+    .sort((a, b) => a.sort_order - b.sort_order || a.created_at.localeCompare(b.created_at));
+  const defaultActions = actionPlaybooks
+    .filter((action) => action.pipeline_key === pipelineKey && !action.service_type_id && action.is_enabled)
+    .sort((a, b) => a.sort_order - b.sort_order || a.created_at.localeCompare(b.created_at));
+  const selectedStatus = pipelineStatuses.find((status) => status.semantic_type === pipelineKey);
+  const selectedService = serviceTypes.find((service) => service.id === serviceTypeId);
+  const showingInherited = customizeService && Boolean(serviceTypeId) && selectedActions.length === 0 && defaultActions.length > 0;
+  const visibleActions = showingInherited ? defaultActions : selectedActions;
+  const appliesToLabel = customizeService && selectedService ? selectedService.label : "All services";
+
+  function chooseAllServices() {
+    setCustomizeService(false);
+    setServiceTypeId("");
+    setAddingStep(false);
+  }
+
+  return (
+    <section className="data-panel settings-panel action-playbook-editor">
+      <div className="playbook-hero">
+        <div>
+          <h2>Team Steps</h2>
+          <p>When {indefiniteTerm(terminology.job_singular)} is at this stage, what should your team do next?</p>
+        </div>
+        <span>{pluralize(actionPlaybooks.filter((action) => action.is_enabled).length, "active step")}</span>
+      </div>
+
+      <div className="playbook-picker">
+        <label>
+          Stage
+          <select value={pipelineKey} onChange={(event) => setPipelineKey(event.target.value as JobStatus)}>
+            {pipelineStatuses.map((status) => (
+              <option key={status.semantic_type} value={status.semantic_type}>
+                {status.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="playbook-applies-control" aria-label="Choose which services use these steps">
+          <span>Applies to</span>
+          <div>
+            <button aria-pressed={!customizeService} className={!customizeService ? "active" : ""} onClick={chooseAllServices} type="button">
+              All services
+            </button>
+            <button
+              className={customizeService ? "active" : ""}
+              aria-pressed={customizeService}
+              onClick={() => {
+                setCustomizeService(true);
+                setServiceTypeId(serviceTypeId || serviceTypes[0]?.id || "");
+              }}
+              type="button"
+            >
+              A specific service
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {customizeService ? (
+        <div className="playbook-service-strip">
+          <label>
+            Service
+            <select value={serviceTypeId} onChange={(event) => setServiceTypeId(event.target.value)}>
+              {serviceTypes.map((service) => (
+                <option key={service.id || service.key} value={service.id}>
+                  {service.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <p>
+            {showingInherited
+              ? `${selectedService?.label ?? "This service"} is currently using the All services steps.`
+              : `Using custom steps for ${selectedService?.label ?? "this service"}.`}
+          </p>
+        </div>
+      ) : (
+        <p className="playbook-fallback-note">These steps apply to every service unless a service has its own steps.</p>
+      )}
+
+      {showingInherited ? (
+        <div className="playbook-inherited-callout">
+          <div>
+            <strong>Based on All services</strong>
+            <p>Customize this service when its sales or delivery steps need to be different.</p>
+          </div>
+          <button className="button button-secondary" onClick={() => setAddingStep(true)} type="button">
+            Customize for this service
+          </button>
+        </div>
+      ) : null}
+
+      <div className="playbook-section-heading">
+        <div>
+          <h3>Recommended next steps</h3>
+          <p>What should your team do when {indefiniteTerm(terminology.job_singular)} reaches {selectedStatus?.label ?? "this stage"}?</p>
+        </div>
+        <button className="button" onClick={() => setAddingStep((current) => !current)} type="button">
+          + Add next step
+        </button>
+      </div>
+
+      <div className="intake-fields-list playbook-list">
+        {visibleActions.length ? (
+          visibleActions.map((action, index) => (
+            <details className={action.is_enabled ? "playbook-step-row" : "playbook-step-row disabled-field"} key={`${showingInherited ? "inherited" : "own"}-${action.id}`}>
+              <summary>
+                <span className="playbook-reorder-handle" aria-hidden="true">::</span>
+                <span className="playbook-action-icon" aria-hidden="true">
+                  <ActionTypeIcon type={action.action_type} />
+                </span>
+                <span className="playbook-step-copy">
+                  <strong>{action.action_label}</strong>
+                  <em>{actionDescription(action.action_type, terminology)}</em>
+                </span>
+                {showingInherited ? <span className="playbook-inherited-badge">All services</span> : <span className={action.is_enabled ? "switch-pill on" : "switch-pill"}>{action.is_enabled ? "On" : "Off"}</span>}
+              </summary>
+              {showingInherited ? (
+                <p className="playbook-row-note">To change this for {selectedService?.label ?? "this service"}, add a custom step below.</p>
+              ) : (
+                <>
+              <form className="settings-form intake-field-form" action={updateActionPlaybook}>
+                <input type="hidden" name="businessId" value={business.id} />
+                <input type="hidden" name="playbookId" value={action.id} />
+                <input type="hidden" name="actionType" value={action.action_type} />
+                <SupportModeInput supportMode={supportMode} />
+                <div className="field">
+                  <label htmlFor={`playbook-label-${action.id}`}>{action.action_type === "custom_instruction" ? "Instruction" : "Button label"}</label>
+                  <input id={`playbook-label-${action.id}`} name="actionLabel" defaultValue={action.action_label} maxLength={120} required />
+                </div>
+                <label className="toggle-row">
+                  <input name="enabled" type="checkbox" defaultChecked={action.is_enabled} />
+                  <span>Show this step to the team</span>
+                </label>
+                <SubmitButton>Save action</SubmitButton>
+              </form>
+              <ConfigMoveButtons
+                businessId={business.id}
+                configType="playbooks"
+                disabledDown={index === selectedActions.length - 1}
+                disabledUp={index === 0}
+                itemId={action.id}
+                pipelineKey={pipelineKey}
+                serviceTypeId={serviceTypeId}
+                supportMode={supportMode}
+              />
+              </>
+              )}
+            </details>
+          ))
+        ) : (
+          <div className="empty-state compact-empty-state">
+            <h3>No steps yet</h3>
+            <p>Add one or two next steps your team should take at this stage.</p>
+          </div>
+        )}
+      </div>
+
+      {addingStep ? (
+        <div className="playbook-add-sheet">
+          <div className="panel-heading compact">
+            <div>
+              <h3>Add next step</h3>
+              <p className="muted">Choose what your team should see for {appliesToLabel}.</p>
+            </div>
+            <button className="icon-button" onClick={() => setAddingStep(false)} type="button" aria-label="Close add next step">
+              x
+            </button>
+          </div>
+          <div className="playbook-action-picker">
+            {actionTypeOrder.map((type) => (
+              <button aria-pressed={newActionType === type} className={newActionType === type ? "active" : ""} key={type} onClick={() => setNewActionType(type)} type="button">
+                <ActionTypeIcon type={type} />
+                <span>{defaultActionLabel(type, terminology)}</span>
+                <em>{actionDescription(type, terminology)}</em>
+              </button>
+            ))}
+          </div>
+          <form className="settings-form intake-field-form" action={createActionPlaybook}>
+          <input type="hidden" name="businessId" value={business.id} />
+          <input type="hidden" name="pipelineKey" value={pipelineKey} />
+          <input type="hidden" name="serviceTypeId" value={customizeService ? serviceTypeId : ""} />
+          <input type="hidden" name="actionType" value={newActionType} />
+          <SupportModeInput supportMode={supportMode} />
+          <div className="field">
+            <label htmlFor="new-playbook-label">{newActionType === "custom_instruction" ? "Custom step" : "Step label"}</label>
+            <input
+              id="new-playbook-label"
+              key={newActionType}
+              name="actionLabel"
+              placeholder={customStepPlaceholder(newActionType, terminology)}
+              defaultValue={newActionType === "custom_instruction" ? "" : defaultActionLabel(newActionType, terminology)}
+              maxLength={120}
+              required
+            />
+          </div>
+          <SubmitButton>Add next step</SubmitButton>
+        </form>
+        </div>
+      ) : null}
+    </section>
   );
 }
 
@@ -2428,19 +3338,69 @@ function IntakeFieldInputs({ businessId, field, supportMode }: { businessId: str
   );
 }
 
+function actionDescription(type: ActionPlaybookType, terminology: Terminology) {
+  const customer = lowerTerm(terminology.customer_singular);
+  const job = lowerTerm(terminology.job_singular);
+  const quote = lowerTerm(terminology.quote_singular);
+
+  return {
+    call: `Reach out to the ${customer} directly.`,
+    custom_instruction: "Show a custom instruction for your team.",
+    email: `Send an email to the ${customer}.`,
+    mark_contacted: `Record that the ${customer} has been contacted.`,
+    mark_lost: `Close out work that is not moving forward.`,
+    open_opportunity: `Open the full ${job} record.`,
+    review_proposal: `Open and review the current ${quote}.`,
+    schedule: `Add or update the confirmed schedule.`,
+    set_follow_up: "Choose the next contact date.",
+  }[type];
+}
+
+function customStepPlaceholder(type: ActionPlaybookType, terminology: Terminology) {
+  if (type === "custom_instruction") {
+    return "Confirm insurance claim number";
+  }
+
+  return defaultActionLabel(type, terminology);
+}
+
+function ActionTypeIcon({ type }: { type: ActionPlaybookType }) {
+  const paths: Record<ActionPlaybookType, string> = {
+    call: "M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1 1 .4 2 .7 2.8a2 2 0 0 1-.5 2.1L8.1 9.9a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.5c.9.3 1.8.6 2.8.7a2 2 0 0 1 1.7 2.1Z",
+    custom_instruction: "M12 20h9M12 4h9M4 9h16M4 15h16M4 4h.01M4 20h.01",
+    email: "M4 4h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Zm18 3-10 6L2 7",
+    mark_contacted: "M20 6 9 17l-5-5",
+    mark_lost: "M18 6 6 18M6 6l12 12",
+    open_opportunity: "M14 3h7v7M10 14 21 3M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5",
+    review_proposal: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Zm0 0v6h6M8 13h8M8 17h6",
+    schedule: "M8 2v4M16 2v4M3 10h18M5 4h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Z",
+    set_follow_up: "M12 8v5l3 2M21 12a9 9 0 1 1-9-9 9 9 0 0 1 9 9Z",
+  };
+
+  return (
+    <svg viewBox="0 0 24 24" focusable="false">
+      <path d={paths[type]} />
+    </svg>
+  );
+}
+
 function ConfigMoveButtons({
   businessId,
   configType,
   disabledDown,
   disabledUp,
   itemId,
+  pipelineKey,
+  serviceTypeId,
   supportMode,
 }: {
   businessId: string;
-  configType: "services" | "pipeline" | "dashboard";
+  configType: "services" | "pipeline" | "dashboard" | "playbooks";
   disabledDown: boolean;
   disabledUp: boolean;
   itemId: string;
+  pipelineKey?: JobStatus;
+  serviceTypeId?: string;
   supportMode: SupportMode;
 }) {
   return (
@@ -2450,6 +3410,8 @@ function ConfigMoveButtons({
         <input type="hidden" name="configType" value={configType} />
         <input type="hidden" name="itemId" value={itemId} />
         <input type="hidden" name="direction" value="up" />
+        {pipelineKey ? <input type="hidden" name="pipelineKey" value={pipelineKey} /> : null}
+        {serviceTypeId !== undefined ? <input type="hidden" name="serviceTypeId" value={serviceTypeId} /> : null}
         <SupportModeInput supportMode={supportMode} />
         <button className="button button-secondary" disabled={disabledUp} type="submit">
           Move up
@@ -2460,6 +3422,8 @@ function ConfigMoveButtons({
         <input type="hidden" name="configType" value={configType} />
         <input type="hidden" name="itemId" value={itemId} />
         <input type="hidden" name="direction" value="down" />
+        {pipelineKey ? <input type="hidden" name="pipelineKey" value={pipelineKey} /> : null}
+        {serviceTypeId !== undefined ? <input type="hidden" name="serviceTypeId" value={serviceTypeId} /> : null}
         <SupportModeInput supportMode={supportMode} />
         <button className="button button-secondary" disabled={disabledDown} type="submit">
           Move down
@@ -2792,27 +3756,29 @@ export function JobFields({
 }
 
 function KpiCard({
-  label,
-  value,
   helper,
+  href,
   icon,
+  label,
   priority = "secondary",
+  value,
 }: {
-  label: string;
-  value: string | number;
   helper: string;
+  href: string;
   icon: React.ReactNode;
+  label: string;
   priority?: "primary" | "secondary";
+  value: string | number;
 }) {
   return (
-    <div className={`kpi-card kpi-card-${priority}`}>
+    <Link className={`kpi-card kpi-card-${priority} kpi-card-link`} href={href}>
       <div className="kpi-icon" aria-hidden="true">
         {icon}
       </div>
       <p>{label}</p>
       <strong>{value}</strong>
       <span>{helper}</span>
-    </div>
+    </Link>
   );
 }
 
@@ -2873,7 +3839,7 @@ function viewTitle(view: View, terminology: Terminology) {
     Customers: `${terminology.customer_singular} list`,
     Calendar: "Field schedule",
     Analytics: "Performance snapshot",
-    Settings: "Workspace settings",
+    Settings: "Settings",
   };
 
   return titles[view];
